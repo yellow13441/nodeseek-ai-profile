@@ -6,7 +6,7 @@
 
 当前版本：**v2.7.1**
 
-发布状态：**v2.7 功能与发布前清单已测试通过，Greasy Fork 待发布**
+发布状态：**v2.7.1 已在 GitHub 与 Greasy Fork 正式发布**
 
 > 作者：yellow13441  
 > 联系方式：yellow13441@gmail.com  
@@ -47,11 +47,8 @@
 
 ### Greasy Fork
 
-> 尚未正式发布，发布后补充。
-
-```text
-TODO_GREASY_FORK_URL
-```
+- 脚本主页：[NodeSeek 用户 AI 画像 - DeepSeek / OpenAI](https://greasyfork.org/zh-CN/scripts/591948-nodeseek-%E7%94%A8%E6%88%B7-ai-%E7%94%BB%E5%83%8F-deepseek-openai)
+- 打开脚本主页后点击 **“安装此脚本”** 即可安装；后续版本会从 GitHub `main` 分支自动同步。
 
 ---
 
