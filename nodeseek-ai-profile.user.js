@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NodeSeek 用户 AI 画像 - DeepSeek / OpenAI
 // @namespace    https://www.nodeseek.com/
-// @version      2.7.0
+// @version      2.7.1
 // @description  NodeSeek 用户 AI 画像与深度交易分析：支持多用户并发、可配置历史采样/语境核验、自定义画像 Prompt 预设、多 AI Provider、管理记录与图片分享。
 // @author       yellow13441 <yellow13441@gmail.com>
 // @license      MIT
@@ -4616,7 +4616,7 @@ ${escapeDataForPrompt(payload)}
       const details=document.createElement("div"); details.className="ns-ai-inline-moderation-details"; details.style.display="none";
       for(const row of mod.rows){ const r=document.createElement("div"); r.className="ns-ai-inline-mod-row"; const t=document.createElement("strong"); t.textContent=`${moderationLabel(row)} #${row.record_id||"-"}`; const reason=document.createElement("div"); reason.textContent=`原因：${row.reason_text||"-"}`; const act=document.createElement("div"); act.textContent=`处理：${fixTimezoneInText(row.actions_text)||"-"}`; r.append(t,reason,act); if(row.post_url){const a=document.createElement("a");a.href=row.post_url;a.target="_blank";a.rel="noopener noreferrer";a.textContent="查看原帖";r.appendChild(a);} details.appendChild(r);}
       modSec.append(toggle,details);
-    } else if(["error","rate_limited"].includes(mod.status)){ modSec.appendChild(makeButton("单独重试管理记录","ns-ai-inline-toggle",()=>openModerationRecords(account,false))); }
+    } else if(["error","rate_limited"].includes(mod.status)){ modSec.appendChild(makeButton("重新查询管理记录","ns-ai-inline-toggle",()=>openModerationRecords(account,false))); }
     contentEl.appendChild(modSec);
 
     if(Number(account.rank)<=1){const sec=createSection("ℹ️ 规则提醒");const d=document.createElement("div");d.className="ns-ai-empty";d.textContent="该账号当前为 Lv1；若实际发生交易，论坛现行规则要求 Lv1 及以下通过官方中介。这里仅作规则提醒，不作为该账号的负面证据。";sec.appendChild(d);contentEl.appendChild(sec);}
@@ -4882,5 +4882,5 @@ ${escapeDataForPrompt(payload)}
   window.addEventListener("popstate", scheduleInject);
 
   injectButtons();
-  console.log(`[NodeSeek AI] 用户画像 v2.7.0 已加载 · ${aiDisplayName()}`);
+  console.log(`[NodeSeek AI] 用户画像 v2.7.1 已加载 · ${aiDisplayName()}`);
 })();
