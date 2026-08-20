@@ -7,6 +7,8 @@ const vm = require("node:vm");
 
 class DummyElement {
   constructor() {
+    this.nodeType = 1;
+    this.isConnected = true;
     this.style = {};
     this.dataset = {};
     this.className = "";
@@ -27,6 +29,9 @@ class DummyElement {
   addEventListener() {}
   setAttribute() {}
   getAttribute() { return ""; }
+  hasAttribute() { return false; }
+  removeAttribute() {}
+  matches() { return false; }
   contains() { return false; }
   querySelector() { return new DummyElement(); }
   querySelectorAll() { return []; }
@@ -50,7 +55,7 @@ function makeStorage() {
   };
 }
 
-function bootUserscript(store, gmRequest = () => ({ abort() {} }), windowOpen = () => undefined, locationHash = "") {
+function bootUserscript(store, gmRequest = () => ({ abort() {} }), windowOpen = () => undefined, locationHash = "", instrumentation = {}) {
   const document = new DummyElement();
   document.head = new DummyElement();
   document.body = new DummyElement();
@@ -58,6 +63,7 @@ function bootUserscript(store, gmRequest = () => ({ abort() {} }), windowOpen = 
   document.documentElement.clientWidth = 1280;
   document.documentElement.clientHeight = 800;
   document.fonts = { ready: Promise.resolve() };
+  document.hidden = false;
   document.createElement = (tagName) => {
     const element = new DummyElement();
     if (String(tagName).toLowerCase() === "canvas") {
@@ -96,20 +102,42 @@ function bootUserscript(store, gmRequest = () => ({ abort() {} }), windowOpen = 
     location: { origin: "https://www.nodeseek.com", pathname: "/", hash: locationHash },
     screen: { availWidth: 1440, availHeight: 900 },
     navigator: {},
-    GM_getValue: (key, fallback) => store.has(key) ? store.get(key) : fallback,
-    GM_setValue: (key, value) => store.set(key, value),
+    GM_getValue: (key, fallback) => {
+      instrumentation.gmGetCount = (instrumentation.gmGetCount || 0) + 1;
+      return store.has(key) ? store.get(key) : fallback;
+    },
+    GM_setValue: (key, value) => {
+      instrumentation.gmSetCount = (instrumentation.gmSetCount || 0) + 1;
+      store.set(key, value);
+    },
     GM_deleteValue: (key) => store.delete(key),
-    GM_listValues: () => [...store.keys()],
-    GM_addValueChangeListener() { return 1; },
+    GM_listValues: () => {
+      instrumentation.gmListCount = (instrumentation.gmListCount || 0) + 1;
+      return [...store.keys()];
+    },
+    GM_addValueChangeListener(_key, callback) {
+      (instrumentation.valueListeners ||= []).push(callback);
+      return 1;
+    },
     GM_registerMenuCommand() {},
     GM_setClipboard() {},
     GM_xmlhttpRequest: gmRequest,
-    MutationObserver: class { observe() {} },
+    MutationObserver: class {
+      constructor(callback) { instrumentation.mutationCallback = callback; }
+      observe() { instrumentation.observerObserveCount = (instrumentation.observerObserveCount || 0) + 1; }
+      disconnect() { instrumentation.observerDisconnectCount = (instrumentation.observerDisconnectCount || 0) + 1; }
+    },
     sessionStorage: makeStorage(),
     localStorage: makeStorage(),
-    requestAnimationFrame() { return 0; },
+    requestAnimationFrame(callback) {
+      (instrumentation.animationFrames ||= []).push(callback);
+      return instrumentation.animationFrames.length;
+    },
     cancelAnimationFrame() {},
-    setInterval() { return 0; },
+    setInterval(callback, delay) {
+      (instrumentation.intervals ||= []).push({ callback, delay });
+      return instrumentation.intervals.length;
+    },
     clearInterval() {},
     setTimeout() { return 0; },
     clearTimeout() {},
@@ -132,15 +160,19 @@ function bootUserscript(store, gmRequest = () => ({ abort() {} }), windowOpen = 
   const expose = `globalThis.__nsTest = {
     AI_SETTINGS, CONFIG, IS_TASK_WORKER, SHARE_PRIVACY_MESSAGE, makeDefaultSettings, sanitizeProviderSettings, sanitizeImageHosting, PROVIDER_DEFS, IMAGE_HOST_DEFS,
     buildFastUserPrompt, normalizeFastProfile, resolvePrimaryOpenMode, getUserState,
+    calcJoinDays, normalizeAccountInfo, refreshAccountDerivedFields,
     configuredMaxTokens, configuredTimeoutMs, readUploadHistory, parse16HostResponse,
     imageHostCredential, configuredImageHostIds, chooseImageHostForShare,
     uploadImageToProvider, deleteUploadedImage, createImageHostTestBlob, runImageHostConnectivityTest,
     PROFILE_WAIT_HINTS, CUSTOM_WAIT_HINTS, TRADE_WAIT_HINTS, activeConfigFingerprint, rebuildActiveAi,
-    openSettingsModal, renderAiPane, renderAnalysisPane, renderPromptPane, renderImagePane,
+    openSettingsModal, renderAiPane, renderAnalysisPane, renderPromptPane, renderImagePane, renderEnhancementPane, settingsPaneEl,
     buildLocalCacheKey, readCache, writeCache, clearCache,
-    createPersistentTaskRecord, readPersistentTask, writePersistentTask, deletePersistentTask, cleanupPersistentTasks, isPersistentTaskActive, hasRunningTasks,
+    createPersistentTaskRecord, readPersistentTask, writePersistentTask, deletePersistentTask, cleanupPersistentTasks, cleanupPersistentTaskRecord, isPersistentTaskActive, hasRunningTasks,
     externalTaskSnapshot, cancelTask,
-    startPersistentAnalysis, taskWorkerUrl, wakeTaskWorker
+    startPersistentAnalysis, taskWorkerUrl, wakeTaskWorker,
+    updateUidButtons, registerProfileWrap, hydrateUidStorageState, handlePersistentTaskSignal, syncPersistentTasks,
+    accountPreviewLevelClass, accountPreviewMetricTone, renderFullAccountPreview, accountPreviewEl,
+    persistentProgressFingerprint
   };\n})();`;
   source = source.replace(/\}\)\(\);\s*$/, expose);
   vm.createContext(context);
@@ -185,9 +217,113 @@ function mockImageHostRequest(options) {
 
 const api = bootUserscript(store, mockImageHostRequest);
 
+// Performance regression guards: an idle NodeSeek page must not install a task polling interval
+// or enumerate the complete Tampermonkey storage namespace.
+const idlePerf = {};
+const idleApi = bootUserscript(new Map(), mockImageHostRequest, () => undefined, "", idlePerf);
+assert.deepEqual(idlePerf.intervals || [], [], "an idle page with GM value listeners must not install a polling interval");
+assert.equal(idlePerf.gmListCount || 0, 0, "an idle page must not enumerate all GM values during startup");
+
+const buttonAttributes = new Map();
+let buttonText = "AI 画像";
+let buttonTextWrites = 0;
+const perfButton = {
+  get textContent() { return buttonText; },
+  set textContent(value) { buttonTextWrites += 1; buttonText = String(value); },
+  getAttribute(name) { return buttonAttributes.has(name) ? buttonAttributes.get(name) : null; },
+  setAttribute(name, value) { buttonAttributes.set(name, String(value)); },
+  hasAttribute(name) { return buttonAttributes.has(name); },
+  removeAttribute(name) { buttonAttributes.delete(name); },
+};
+const perfClasses = new Set();
+const perfWrap = {
+  isConnected: true,
+  dataset: { uid: "900" },
+  classList: {
+    contains(name) { return perfClasses.has(name); },
+    toggle(name, enabled) { if (enabled) perfClasses.add(name); else perfClasses.delete(name); },
+  },
+  querySelector(selector) { return selector === ".ns-ai-profile-tag" ? perfButton : null; },
+};
+idleApi.registerProfileWrap("900", perfWrap);
+const idleButtonGmReads = idlePerf.gmGetCount || 0;
+idleApi.updateUidButtons("900");
+idleApi.updateUidButtons("900");
+assert.equal(buttonTextWrites, 0, "idempotent button updates must not rewrite an unchanged text node");
+assert.equal(idlePerf.gmGetCount || 0, idleButtonGmReads, "button rendering must not read GM storage");
+idleApi.getUserState("900").fast.result = { oneLiner: "cached" };
+idleApi.updateUidButtons("900");
+idleApi.updateUidButtons("900");
+assert.equal(buttonTextWrites, 1, "a changed button state must be written exactly once");
+
+const ownMutationTarget = { nodeType: 1, closest() { return {}; } };
+const frameCountBeforeOwnMutation = (idlePerf.animationFrames || []).length;
+idlePerf.mutationCallback?.([{ target: ownMutationTarget, addedNodes: [{ nodeType: 3, parentElement: ownMutationTarget }] }]);
+assert.equal((idlePerf.animationFrames || []).length, frameCountBeforeOwnMutation, "mutations inside the userscript UI must be ignored");
+const outsideMutationTarget = { nodeType: 1, closest() { return null; } };
+const addedAuthor = { nodeType: 1, closest() { return null; }, matches() { return true; }, querySelector() { return null; } };
+idlePerf.mutationCallback?.([{ target: outsideMutationTarget, addedNodes: [addedAuthor] }]);
+assert.equal((idlePerf.animationFrames || []).length, frameCountBeforeOwnMutation + 1, "a newly added author subtree must schedule one scoped injection");
+
+const signalTask = { ...idleApi.createPersistentTaskRecord("900", "fast", false), status: "running", workerId: "worker-test" };
+idleApi.writePersistentTask(signalTask);
+const signalListCount = idlePerf.gmListCount || 0;
+const signalGetCount = idlePerf.gmGetCount || 0;
+idleApi.handlePersistentTaskSignal({ uid: "900", mode: "fast", id: signalTask.id });
+assert.equal(idlePerf.gmListCount || 0, signalListCount, "a targeted task signal must not enumerate all GM values");
+assert.equal((idlePerf.gmGetCount || 0) - signalGetCount, 1, "a targeted task signal should read only its task slot");
+idleApi.deletePersistentTask("900", "fast");
+idleApi.handlePersistentTaskSignal({ uid: "900", mode: "fast", id: signalTask.id, deleted: true });
+assert.equal(idleApi.getUserState("900").fast.status, "done", "a targeted deletion signal should reveal an existing local result");
+assert.equal(idleApi.getUserState("900").fast.task, null, "a targeted deletion signal must release the external running task");
+const cleanupListCount = idlePerf.gmListCount || 0;
+idleApi.syncPersistentTasks(false);
+assert.equal((idlePerf.gmListCount || 0) - cleanupListCount, 1, "a full fallback sync must reuse one task enumeration");
+
+const firstWaitFingerprint = idleApi.persistentProgressFingerprint({ uid:"900", progress:{ title:"等待", percent:50, hint:"提示", items:[{ state:"active", text:"等待模型返回 · 1.0s" }] } });
+const laterWaitFingerprint = idleApi.persistentProgressFingerprint({ uid:"900", progress:{ title:"等待", percent:50, hint:"提示", items:[{ state:"active", text:"等待模型返回 · 9.5s" }] } });
+assert.equal(firstWaitFingerprint, laterWaitFingerprint, "the local elapsed timer must not create a cross-tab progress revision");
+
+const workerPerf = {};
+bootUserscript(new Map(), mockImageHostRequest, () => undefined, "#ns-ai-profile-task-worker-v1", workerPerf);
+assert.ok((workerPerf.intervals || []).some(({ delay }) => delay === 1000), "the worker must keep a lightweight one-second lifecycle tick");
+assert.ok(!(workerPerf.intervals || []).some(({ delay }) => delay === 500), "the worker must not restore the old 500ms full-scan loop");
+
 assert.equal(api.makeDefaultSettings().providers["openai-compatible"].model, "gpt-5.6-sol");
 assert.equal(api.makeDefaultSettings().imageHosting.selectionMode, "fixed");
 assert.equal(api.AI_SETTINGS.providers["openai-compatible"].model, "gpt-5.6", "existing model must be preserved");
+const fifteenPointTwoDaysAgo = new Date(Date.now() - (15.2 * 24 * 60 * 60 * 1000)).toISOString();
+assert.equal(api.calcJoinDays(fifteenPointTwoDaysAgo), 16, "join days must use NodeSeek's inclusive/ceil display convention");
+const staleDerivedAccount = { createdAt: fifteenPointTwoDaysAgo, joinDays: 15 };
+api.refreshAccountDerivedFields(staleDerivedAccount);
+assert.equal(staleDerivedAccount.joinDays, 16, "old cached accounts must receive the corrected join-day value");
+const socialAccount = api.normalizeAccountInfo("66", { detail: {
+  member_name: "social-user", rank: 6, coin: 8200, stardust: 120,
+  created_at: fifteenPointTwoDaysAgo, nPost: 8, nComment: 90,
+  following_count: 12, follower_count: 345,
+} });
+assert.equal(socialAccount.following, 12, "following count should be reused when the existing account response contains it");
+assert.equal(socialAccount.followers, 345, "follower count should be reused without another endpoint request");
+const relationFlagsOnly = api.normalizeAccountInfo("67", { detail: { member_name:"flag-user", following:true, followers:false } });
+assert.equal(relationFlagsOnly.following, null, "viewer relationship flags must not be mistaken for public following counts");
+assert.equal(relationFlagsOnly.followers, null, "viewer relationship flags must not be mistaken for public follower counts");
+assert.notEqual(api.accountPreviewLevelClass(1), api.accountPreviewLevelClass(6), "Lv1 and Lv6 must have visibly distinct level classes");
+assert.notEqual(api.accountPreviewMetricTone("age", 6), api.accountPreviewMetricTone("age", 900), "new and established accounts must use different age tones");
+assert.notEqual(api.accountPreviewMetricTone("coin", 50), api.accountPreviewMetricTone("coin", 8200), "low and high chicken-leg counts must use different tones");
+assert.notEqual(api.accountPreviewMetricTone("stardust", 2), api.accountPreviewMetricTone("stardust", 120), "low and high stardust counts must use different tones");
+api.renderFullAccountPreview(socialAccount, new DummyElement());
+assert.match(api.accountPreviewEl.innerHTML, /ns-ai-rank-6/);
+assert.match(api.accountPreviewEl.innerHTML, /注册天数/);
+assert.match(api.accountPreviewEl.innerHTML, /关注[\s\S]*12/);
+assert.match(api.accountPreviewEl.innerHTML, /粉丝[\s\S]*345/);
+assert.match(api.accountPreviewEl.innerHTML, /href="\/space\/66#\/discussions"/);
+assert.match(api.accountPreviewEl.innerHTML, /href="\/space\/66#\/comments"/);
+assert.match(api.accountPreviewEl.innerHTML, /href="\/notification#\/message\?mode=talk&amp;to=66"/);
+assert.equal((api.accountPreviewEl.innerHTML.match(/target="_blank"/g) || []).length, 3, "profile history and private-message links should preserve the current thread in a new tab");
+assert.doesNotMatch(api.accountPreviewEl.innerHTML, /30 分钟账号缓存|仅使用公开账号资料|未调用 AI 或第三方服务/, "the compact preview must not repeat cache/source explanations");
+api.openSettingsModal();
+api.renderEnhancementPane();
+assert.match(api.settingsPaneEl.innerHTML, /仅使用 NodeSeek 公开账号资料，不调用 AI 或第三方服务；账号资料缓存 30 分钟/);
 assert.deepEqual(
   JSON.parse(JSON.stringify(api.AI_SETTINGS.moderation)),
   { includeInProfile: true, includeInTrade: false },
@@ -261,6 +397,21 @@ popupApi.deletePersistentTask("779", "fast");
 popupApi.deletePersistentTask("780", "deep");
 const workerApi = bootUserscript(store, mockImageHostRequest, () => undefined, "#ns-ai-profile-task-worker-v1");
 assert.equal(workerApi.IS_TASK_WORKER, true, "worker URL must enter the dedicated task-window runtime");
+const concurrentFastTask = workerApi.createPersistentTaskRecord("784", "fast", false);
+const concurrentDeepTask = workerApi.createPersistentTaskRecord("785", "deep", false);
+workerApi.writePersistentTask(concurrentFastTask);
+workerApi.writePersistentTask(concurrentDeepTask);
+workerApi.wakeTaskWorker("784", "fast", concurrentFastTask.id);
+workerApi.wakeTaskWorker("785", "deep", concurrentDeepTask.id);
+assert.equal(workerApi.readPersistentTask("784", "fast").status, "running", "the reusable worker must claim the first concurrent task");
+assert.equal(workerApi.readPersistentTask("785", "deep").status, "running", "a second task must not remain stuck while the first task is starting");
+assert.equal(
+  workerApi.readPersistentTask("784", "fast").workerId,
+  workerApi.readPersistentTask("785", "deep").workerId,
+  "both concurrent tasks should be owned by the reusable worker window",
+);
+workerApi.deletePersistentTask("784", "fast");
+workerApi.deletePersistentTask("785", "deep");
 const directlyWokenTask = workerApi.createPersistentTaskRecord("781", "fast", false);
 workerApi.writePersistentTask(directlyWokenTask);
 workerApi.wakeTaskWorker("781", "fast", directlyWokenTask.id);

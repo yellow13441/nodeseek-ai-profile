@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NodeSeek 用户 AI 画像 - DeepSeek / OpenAI
 // @namespace    https://www.nodeseek.com/
-// @version      2.8.0
-// @description  NodeSeek 用户 AI 画像与深度交易分析：支持跨刷新长任务、管理记录、多图床、自定义采样/Prompt、可配置 Token 与超时、多 AI Provider。
+// @version      2.8.1
+// @description  NodeSeek 用户 AI 画像与深度交易分析：支持跨刷新长任务、管理记录、多图床、按需账号速览、自定义采样/Prompt、可配置 Token 与超时、多 AI Provider。
 // @author       yellow13441 <yellow13441@gmail.com>
 // @license      MIT
 // @homepageURL  https://github.com/yellow13441/nodeseek-ai-profile
@@ -75,7 +75,7 @@
   //
 
   const SETTINGS_KEY = "ns-ai-profile-v2.8-settings";
-  const SETTINGS_SCHEMA_VERSION = 10;
+  const SETTINGS_SCHEMA_VERSION = 11;
 
   const OUTPUT_TOKEN_DEFAULTS = {
     profile: 12000,
@@ -264,6 +264,7 @@
       version: SETTINGS_SCHEMA_VERSION,
       activeProvider: "deepseek",
       moderation: { includeInProfile: true, includeInTrade: true },
+      accountPreview: { enabled: false },
       imageHosting: {
         selectionMode: "fixed",
         activeProvider: "sixteen",
@@ -444,6 +445,7 @@
         includeInProfile: raw?.moderation?.includeInProfile !== false,
         includeInTrade: raw?.moderation?.includeInTrade ?? (raw?.includeModerationInDeep !== false),
       },
+      accountPreview: { enabled: raw?.accountPreview?.enabled === true },
       imageHosting: sanitizeImageHosting(raw?.imageHosting, raw?.imageHost),
       analysis: {
         fast: sanitizeAnalysisMode(raw?.analysis?.fast, ANALYSIS_DEFAULTS.fast, false),
@@ -451,7 +453,7 @@
       },
       customProfile,
       ui: {
-        settingsTab: ["ai", "analysis", "prompt", "image"].includes(raw?.ui?.settingsTab) ? raw.ui.settingsTab : "ai",
+        settingsTab: ["ai", "analysis", "prompt", "image", "enhancement"].includes(raw?.ui?.settingsTab) ? raw.ui.settingsTab : "ai",
         settingsRect: raw?.ui?.settingsRect && typeof raw.ui.settingsRect === "object" ? raw.ui.settingsRect : null,
       },
       providers: {},
@@ -469,6 +471,7 @@
         includeInProfile: settings?.moderation?.includeInProfile !== false,
         includeInTrade: settings?.moderation?.includeInTrade !== false,
       },
+      accountPreview: { enabled: settings?.accountPreview?.enabled === true },
       imageHosting: sanitizeImageHosting(settings?.imageHosting, settings?.imageHost),
       analysis: {
         fast: sanitizeAnalysisMode(settings?.analysis?.fast, ANALYSIS_DEFAULTS.fast, false),
@@ -476,7 +479,7 @@
       },
       customProfile: sanitizeCustomProfile(settings?.customProfile),
       ui: {
-        settingsTab: ["ai", "analysis", "prompt", "image"].includes(settings?.ui?.settingsTab) ? settings.ui.settingsTab : "ai",
+        settingsTab: ["ai", "analysis", "prompt", "image", "enhancement"].includes(settings?.ui?.settingsTab) ? settings.ui.settingsTab : "ai",
         settingsRect: settings?.ui?.settingsRect && typeof settings.ui.settingsRect === "object" ? settings.ui.settingsRect : null,
       },
       providers: {},
@@ -581,10 +584,21 @@
 
     fastCacheTtl: 30 * 60 * 1000,
     deepCacheTtl: 30 * 60 * 1000,
+    accountCacheTtl: 30 * 60 * 1000,
 
     fastCachePrefix: "ns-ai-profile-v2.8-fast:",
     deepCachePrefix: "ns-ai-profile-v2.8-deep:",
+    accountCachePrefix: "ns-ai-profile-v2.8-account:",
     cacheMaxEntries: 80,
+    accountCacheMaxEntries: 160,
+
+    // 账号速览默认关闭。开启后也只在桌面端有效悬停时按需请求，并对被动请求单独限速。
+    accountPreviewHoverDelayMs: 500,
+    accountPreviewHideDelayMs: 180,
+    accountPreviewRequestMinGapMs: 1000,
+    accountPreviewRequestWindowMs: 60 * 1000,
+    accountPreviewRequestMaxPerWindow: 8,
+    accountPreviewCooldownMs: 60 * 1000,
 
     // 长请求由一个可复用的 NodeSeek 临时窗口承接。任务状态和结果通过 GM 存储跨页面同步。
     taskKeyPrefix: "ns-ai-profile-v2.8-task:",
@@ -596,7 +610,15 @@
     taskQueueStaleMs: 30 * 1000,
     taskStaleMs: 3 * 60 * 1000,
     taskRetentionMs: 30 * 60 * 1000,
-    taskSyncIntervalMs: 1800,
+    // 普通页面主要依赖 GM 变更事件同步；只有监听不可用时才轮询已知活动任务。
+    taskBridgeFallbackPollMs: 5000,
+    taskBridgeWatchdogPollMs: 15 * 1000,
+    // 临时窗口的本地 UI 可以平滑刷新，但持久化心跳和全量兜底扫描必须低频。
+    taskProgressHeartbeatMs: 5000,
+    taskProgressMinWriteGapMs: 250,
+    taskWorkerTickMs: 1000,
+    taskWorkerFallbackScanMs: 5000,
+    taskWorkerWatchdogScanMs: 30 * 1000,
   };
 
   const IS_TASK_WORKER = String(location.hash || "") === CONFIG.taskWorkerHash;
@@ -1607,11 +1629,62 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
     .ns-ai-inline-toggle { margin-top:7px; }
     .ns-ai-toast { position:fixed; right:18px; bottom:18px; z-index:2147483646; max-width:320px; padding:9px 12px; border-radius:8px; background:#27313a; color:#fff; font-size:11px; box-shadow:0 8px 26px rgba(0,0,0,.22); opacity:0; transform:translateY(8px); transition:.18s ease; pointer-events:none; }
     .ns-ai-toast.show { opacity:1; transform:translateY(0); }
+    #ns-ai-account-preview { position:fixed; display:none; z-index:2147483645; width:min(300px,calc(100vw - 16px)); box-sizing:border-box; padding:12px; border:1px solid rgba(85,61,117,.18); border-radius:12px; background:rgba(255,255,255,.98); color:#34414c; box-shadow:0 14px 36px rgba(30,22,41,.2),0 2px 8px rgba(0,0,0,.08); font:11px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; text-align:left; }
+    .ns-ai-account-preview-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:2px; }
+    .ns-ai-account-preview-name { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#49356b; font-size:14px; font-weight:850; }
+    .ns-ai-account-preview-level { flex:0 0 auto; min-width:44px; padding:4px 9px; border-radius:999px; background:linear-gradient(135deg,#6750a4,#8e44ad); color:#fff; font-size:13px; font-weight:900; line-height:1.25; text-align:center; text-shadow:0 1px 2px rgba(0,0,0,.24); box-shadow:0 3px 9px rgba(35,29,47,.18); }
+    .ns-ai-account-preview-level.ns-ai-rank-0 { background:linear-gradient(135deg,#7f8a94,#555f68); }
+    .ns-ai-account-preview-level.ns-ai-rank-1 { background:linear-gradient(135deg,#ef5350,#b71c1c); }
+    .ns-ai-account-preview-level.ns-ai-rank-2 { background:linear-gradient(135deg,#ff9f43,#e8590c); }
+    .ns-ai-account-preview-level.ns-ai-rank-3 { background:linear-gradient(135deg,#ffd43b,#e09b00); color:#3f3100; text-shadow:none; }
+    .ns-ai-account-preview-level.ns-ai-rank-4 { background:linear-gradient(135deg,#42a5f5,#1565c0); }
+    .ns-ai-account-preview-level.ns-ai-rank-5 { background:linear-gradient(135deg,#66bb6a,#218838); }
+    .ns-ai-account-preview-level.ns-ai-rank-6 { background:linear-gradient(135deg,#d946ef,#4f46e5); }
+    .ns-ai-account-preview-meta { color:#8a929a; font-size:9.5px; }
+    .ns-ai-account-preview-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; margin-top:10px; }
+    .ns-ai-account-preview-stat { --ns-ai-preview-accent:#737b84; --ns-ai-preview-surface:#f5f6f7; min-width:0; padding:8px 5px 7px; border:1px solid var(--ns-ai-preview-accent); border-radius:9px; background:var(--ns-ai-preview-surface); text-align:center; box-shadow:inset 0 2px 0 var(--ns-ai-preview-accent); }
+    .ns-ai-account-preview-stat.ns-ai-tone-muted { --ns-ai-preview-accent:#737b84; --ns-ai-preview-surface:#f5f6f7; }
+    .ns-ai-account-preview-stat.ns-ai-tone-rose { --ns-ai-preview-accent:#d63f61; --ns-ai-preview-surface:#fff1f4; }
+    .ns-ai-account-preview-stat.ns-ai-tone-orange { --ns-ai-preview-accent:#d56818; --ns-ai-preview-surface:#fff4e8; }
+    .ns-ai-account-preview-stat.ns-ai-tone-amber { --ns-ai-preview-accent:#ae7600; --ns-ai-preview-surface:#fff8dc; }
+    .ns-ai-account-preview-stat.ns-ai-tone-cyan { --ns-ai-preview-accent:#087f8c; --ns-ai-preview-surface:#ebfbfc; }
+    .ns-ai-account-preview-stat.ns-ai-tone-blue { --ns-ai-preview-accent:#236fca; --ns-ai-preview-surface:#eef6ff; }
+    .ns-ai-account-preview-stat.ns-ai-tone-green { --ns-ai-preview-accent:#238a56; --ns-ai-preview-surface:#edfaf2; }
+    .ns-ai-account-preview-stat.ns-ai-tone-violet { --ns-ai-preview-accent:#7545bc; --ns-ai-preview-surface:#f6f0ff; }
+    .ns-ai-account-preview-stat.ns-ai-tone-magenta { --ns-ai-preview-accent:#b6388f; --ns-ai-preview-surface:#fff0fa; }
+    .ns-ai-account-preview-stat.ns-ai-tone-gold { --ns-ai-preview-accent:#a66b00; --ns-ai-preview-surface:#fff7dc; }
+    .ns-ai-account-preview-value { display:block; overflow:hidden; text-overflow:ellipsis; color:var(--ns-ai-preview-accent); font-size:15px; font-weight:900; line-height:1.25; white-space:nowrap; }
+    .ns-ai-account-preview-value small { margin-left:1px; font-size:9px; font-weight:750; }
+    .ns-ai-account-preview-label { display:block; margin-top:2px; color:#727b84; font-size:9px; font-weight:650; }
+    .ns-ai-account-preview-activity { display:flex; align-items:stretch; justify-content:center; gap:0; margin-top:8px; padding:4px; border-radius:8px; background:#f8f7fa; color:#7d858c; font-size:9.5px; }
+    .ns-ai-account-preview-activity a { flex:1; display:flex; align-items:center; justify-content:center; min-width:0; padding:3px 4px; border-radius:5px; color:inherit; text-align:center; text-decoration:none; transition:background .15s ease,color .15s ease; }
+    .ns-ai-account-preview-activity a + a { border-left:1px solid #e6e2eb; border-top-left-radius:0; border-bottom-left-radius:0; }
+    .ns-ai-account-preview-activity a:hover,.ns-ai-account-preview-activity a:focus-visible { background:#eee8f5; color:#5d3f7c; outline:none; }
+    .ns-ai-account-preview-activity strong { margin-right:3px; color:#51415f; font-size:11px; }
+    .ns-ai-account-preview-activity .ns-ai-account-preview-message { color:#6d4b8c; font-weight:800; }
+    .ns-ai-account-preview-social { display:flex; justify-content:center; gap:18px; margin-top:6px; color:#9299a0; font-size:9px; }
+    .ns-ai-account-preview-social strong { color:#747d85; font-weight:750; }
+    .ns-ai-account-preview-note { margin-top:9px; padding:8px 9px; border-radius:8px; background:#f7f4fb; color:#6b5f77; font-size:9.7px; line-height:1.55; }
+    .ns-ai-account-preview-note.compat { background:#fff8e6; color:#765a1f; border:1px solid #ead8a4; }
+    .ns-ai-account-preview-action { width:100%; margin-top:8px; padding:6px 8px; border:1px solid #dcd4e7; border-radius:7px; background:#fff; color:#624d7a; cursor:pointer; font-size:9.8px; }
+    .ns-ai-account-preview-action:hover { background:#f3eff8; }
     @media (prefers-color-scheme: dark) {
       .ns-ai-profile-menu-popup { background:#232427; color:#ddd; border-color:#444; }
       .ns-ai-profile-menu-popup button:hover { background:#333039; }
       .ns-ai-inline-moderation-details { border-color:#444; }
       .ns-ai-inline-mod-row { border-color:#383838; }
+      #ns-ai-account-preview { background:rgba(32,33,36,.98); color:#ddd; border-color:#494052; }
+      .ns-ai-account-preview-name { color:#d2c2eb; }
+      .ns-ai-account-preview-meta,.ns-ai-account-preview-label,.ns-ai-account-preview-social { color:#9da3a9; }
+      .ns-ai-account-preview-stat { background:#29272d; }
+      .ns-ai-account-preview-activity { background:#29272d; color:#9da3a9; }
+      .ns-ai-account-preview-activity a + a { border-color:#454047; }
+      .ns-ai-account-preview-activity a:hover,.ns-ai-account-preview-activity a:focus-visible { background:#39333f; color:#d5c2ee; }
+      .ns-ai-account-preview-activity strong,.ns-ai-account-preview-social strong { color:#d1c5dc; }
+      .ns-ai-account-preview-note { background:#2d2933; color:#b9abc9; }
+      .ns-ai-account-preview-note.compat { background:#3b3220; color:#e6ca82; border-color:#66552d; }
+      .ns-ai-account-preview-action { background:#29272d; border-color:#494052; color:#cfbff0; }
+      .ns-ai-account-preview-action:hover { background:#35313d; }
     }
   `;
   document.head.appendChild(v26Style);
@@ -1696,6 +1769,7 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
     };
     try {
       GM_setValue(persistentTaskKey(normalized.uid, normalized.mode), JSON.stringify(normalized));
+      if (IS_TASK_WORKER) rememberWorkerRecord(normalized);
       if (notify) signalPersistentTaskUpdate(normalized);
       return normalized;
     } catch { return null; }
@@ -1703,10 +1777,12 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
 
   function deletePersistentTask(uid, mode, notify = true) {
     try {
+      const deletedRecord = notify ? readPersistentTask(uid, mode) : null;
       if (typeof GM_deleteValue === "function") GM_deleteValue(persistentTaskKey(uid, mode));
       else GM_setValue(persistentTaskKey(uid, mode), null);
       clearPersistentTaskCancelIntent(uid, mode);
-      if (notify) signalPersistentTaskUpdate({ uid, mode, deleted: true });
+      if (IS_TASK_WORKER) forgetWorkerRecord(uid, mode);
+      if (notify) signalPersistentTaskUpdate({ ...deletedRecord, uid, mode, deleted: true });
     } catch { /* ignore */ }
   }
 
@@ -1727,40 +1803,54 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
     return !!record && ["queued", "running", "cancelling"].includes(record.status);
   }
 
-  function cleanupPersistentTasks() {
-    const now = Date.now();
-    for (const record of listPersistentTasks()) {
-      const age = now - Number(record.updatedAt || record.createdAt || 0);
-      if (record.status === "cancelling" && !record.workerId) {
-        writePersistentTaskCancelIntent(record);
-        writePersistentTask({
-          ...record,
-          status: "cancelled",
-          cancelRequested: true,
-          error: "已由用户终止查询；任务尚未被临时窗口接收，因此没有调用模型。",
-          finishedAt: now,
-          updatedAt: now,
-        });
-      } else if (record.status === "queued" && !record.workerId && age > CONFIG.taskQueueStaleMs) {
-        writePersistentTask({
-          ...record,
-          status: "error",
-          error: "临时任务窗口未在 30 秒内接收任务，本次尚未调用模型。请重新尝试。",
-          finishedAt: now,
-          updatedAt: now,
-        });
-      } else if (isPersistentTaskActive(record) && age > CONFIG.taskStaleMs) {
-        writePersistentTask({
-          ...record,
-          status: "error",
-          error: "临时任务窗口已关闭或失去响应。为避免重复调用模型，本次不会自动重试。",
-          finishedAt: now,
-          updatedAt: now,
-        });
-      } else if (!isPersistentTaskActive(record) && age > CONFIG.taskRetentionMs) {
-        deletePersistentTask(record.uid, record.mode, false);
-      }
+  function cleanupPersistentTaskRecord(record, now = Date.now()) {
+    if (!record?.uid || !["fast", "deep"].includes(record.mode)) return null;
+    const age = now - Number(record.updatedAt || record.createdAt || 0);
+    if (record.status === "cancelling" && !record.workerId) {
+      writePersistentTaskCancelIntent(record);
+      return writePersistentTask({
+        ...record,
+        status: "cancelled",
+        cancelRequested: true,
+        error: "已由用户终止查询；任务尚未被临时窗口接收，因此没有调用模型。",
+        finishedAt: now,
+        updatedAt: now,
+      });
     }
+    if (record.status === "queued" && !record.workerId && age > CONFIG.taskQueueStaleMs) {
+      return writePersistentTask({
+        ...record,
+        status: "error",
+        error: "临时任务窗口未在 30 秒内接收任务，本次尚未调用模型。请重新尝试。",
+        finishedAt: now,
+        updatedAt: now,
+      });
+    }
+    if (isPersistentTaskActive(record) && age > CONFIG.taskStaleMs) {
+      return writePersistentTask({
+        ...record,
+        status: "error",
+        error: "临时任务窗口已关闭或失去响应。为避免重复调用模型，本次不会自动重试。",
+        finishedAt: now,
+        updatedAt: now,
+      });
+    }
+    if (!isPersistentTaskActive(record) && age > CONFIG.taskRetentionMs) {
+      deletePersistentTask(record.uid, record.mode, false);
+      return null;
+    }
+    return record;
+  }
+
+  function cleanupPersistentTasks(records = null) {
+    const source = Array.isArray(records) ? records : listPersistentTasks();
+    const now = Date.now();
+    const cleaned = [];
+    for (const record of source) {
+      const next = cleanupPersistentTaskRecord(record, now);
+      if (next) cleaned.push(next);
+    }
+    return cleaned;
   }
 
   function createPersistentTaskRecord(uid, mode, force = false) {
@@ -1790,14 +1880,33 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
     };
   }
 
+  function persistentProgressFingerprint(task) {
+    const progress = task?.progress || {};
+    const items = Array.isArray(progress.items) ? progress.items.map((item) => ({
+      state: String(item?.state || ""),
+      // 秒表只在当前窗口本地刷新，不应每 0.5 秒触发跨标签页广播。
+      text: String(item?.text || "").replace(/等待模型返回\s*·\s*[\d.]+s/g, "等待模型返回"),
+    })) : [];
+    return JSON.stringify({
+      title: String(progress.title || ""),
+      percent: Number(progress.percent) || 0,
+      hint: String(progress.hint || ""),
+      items,
+      accountName: getUserState(task.uid).account?.name || "",
+    });
+  }
+
   function persistBoundTaskProgress(task, force = false) {
     if (!IS_TASK_WORKER || !task?.persistentJobId) return;
     const now = Date.now();
-    if (!force && now - Number(task.lastPersistentWriteAt || 0) < 1200) return;
+    const elapsed = now - Number(task.lastPersistentWriteAt || 0);
+    const signature = persistentProgressFingerprint(task);
+    const changed = signature !== task.lastPersistentProgressSignature;
+    if (!force && changed && elapsed < CONFIG.taskProgressMinWriteGapMs) return;
+    if (!force && !changed && elapsed < CONFIG.taskProgressHeartbeatMs) return;
     const record = readPersistentTask(task.uid, task.mode);
     if (!record || record.id !== task.persistentJobId || !isPersistentTaskActive(record)) return;
-    task.lastPersistentWriteAt = now;
-    writePersistentTask({
+    const written = writePersistentTask({
       ...record,
       status: record.cancelRequested ? "cancelling" : "running",
       startedAt: Number(record.startedAt) || task.startedAt,
@@ -1807,6 +1916,10 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
       progress: task.progress || record.progress,
       updatedAt: now,
     });
+    if (written) {
+      task.lastPersistentWriteAt = now;
+      task.lastPersistentProgressSignature = signature;
+    }
   }
 
   function persistBoundTaskFinal(task, status, error = "") {
@@ -1835,6 +1948,13 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
   let activeMode = "fast";
   let lastAccount = null;
   const USER_STATES = new Map();
+  const PROFILE_BUTTON_BINDINGS = new WeakMap();
+  const PROFILE_PREVIEW_BINDINGS = new WeakMap();
+  const PROFILE_BUTTON_WRAPS_BY_UID = new Map();
+  const UID_STORAGE_HYDRATED = new Set();
+  const DEFERRED_TASK_SIGNALS = new Map();
+  let taskBridgeListenerInstalled = false;
+  let taskBridgePollTimer = null;
   let taskSequence = 0;
   let panelUserResized = false;
   let panelUserMoved = false;
@@ -1857,7 +1977,8 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
     for (const state of USER_STATES.values()) {
       if (state.fast.status === "running" || state.deep.status === "running") return true;
     }
-    return listPersistentTasks().some(isPersistentTaskActive);
+    // 仅在用户主动测试/保存设置时做一次兜底枚举，避免常驻轮询。
+    return cleanupPersistentTasks(listPersistentTasks()).some(isPersistentTaskActive);
   }
 
   function makeTask(uid, mode) {
@@ -2069,7 +2190,7 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
 
 
   // ============================================================
-  // 配置中心：AI / 分析模式 / 自定义画像 / 图床
+  // 配置中心：AI / 分析模式 / 自定义画像 / 图床 / 页面增强
   // ============================================================
 
   // 沿用 v2.7 UI key，确保升级后保留设置窗口位置、尺寸和上次页签。
@@ -2079,6 +2200,7 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
     ["analysis", "📊 分析模式"],
     ["prompt", "✍️ 自定义画像"],
     ["image", "🖼️ 图床"],
+    ["enhancement", "🧩 页面增强"],
   ];
 
   function loadSettingsUiState() {
@@ -2106,7 +2228,7 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
       <div class="ns-ai-settings-head ns-ai-settings-drag-handle">
         <div>
           <div class="ns-ai-settings-title">⚙️ NodeSeek AI 设置</div>
-          <div class="ns-ai-settings-sub">AI、数据采样、自定义画像和图床配置彼此独立。拖动标题栏移动，右下角调整大小。</div>
+          <div class="ns-ai-settings-sub">AI、数据采样、自定义画像、图床和页面增强配置彼此独立。拖动标题栏移动，右下角调整大小。</div>
         </div>
         <button class="ns-ai-settings-close" type="button" title="关闭">×</button>
       </div>
@@ -2116,7 +2238,7 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
         <div class="ns-ai-settings-status"></div>
       </div>
       <div class="ns-ai-settings-foot">
-        <div class="ns-ai-settings-foot-note">设置保存在 Tampermonkey 本地；第三方服务只在对应功能实际使用时请求。</div>
+        <div class="ns-ai-settings-foot-note">设置保存在 Tampermonkey 本地；NodeSeek 与第三方服务只在对应功能实际使用时请求。</div>
         <div class="ns-ai-settings-actions">
           <button class="ns-ai-settings-action ns-ai-settings-cancel" type="button">取消</button>
           <button class="ns-ai-settings-action primary ns-ai-settings-save" type="button">保存配置</button>
@@ -2587,12 +2709,38 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
     }
   }
 
+  function renderEnhancementPane(){
+    const enabled=settingsDraft.accountPreview?.enabled===true;
+    settingsPaneEl.innerHTML=`
+      <div class="ns-ai-settings-note">页面增强功能不参与 AI 分析，也不会改变画像、Trade、Prompt 或采样结果。涉及额外 NodeSeek 请求的能力默认关闭。</div>
+      <div class="ns-ai-settings-card">
+        <div class="ns-ai-settings-card-head"><div><div class="ns-ai-settings-provider-name">👤 悬停账号速览</div><div class="ns-ai-settings-help">适用于桌面端鼠标；触摸设备仍保持原有点击操作。</div></div></div>
+        <label class="ns-ai-settings-check"><input class="ns-ai-account-preview-enabled" type="checkbox" ${enabled?"checked":""}><span>悬停“AI 画像”按钮时显示公开账号资料</span></label>
+        <div class="ns-ai-settings-check-note">默认关闭。开启后，鼠标持续停留约 0.5 秒才会按需读取等级、注册天数、鸡腿、星尘、主题和评论数量；若同一次响应包含关注/粉丝数，也会低调显示，绝不为此追加请求。快速划过不会请求。</div>
+        <div class="ns-ai-settings-note" style="margin:12px 0 0;">
+          数据说明：仅使用 NodeSeek 公开账号资料，不调用 AI 或第三方服务；账号资料缓存 30 分钟。这些说明不再占用每张悬浮卡的显示空间。<br><br>
+          请求保护：同一 UID 复用画像结果与账号缓存；并发请求自动合并；被动悬停请求单并发、至少间隔 1 秒且每分钟最多 8 个；403 / 429 后停止继续请求。<br><br>
+          若检测到 Nodeseek Pro 已接管该作者，本脚本不会自动重复访问相同账号接口，只显示兼容提示并保留一次明确的手动加载入口。
+        </div>
+        <div class="ns-ai-analysis-actions"><button class="ns-ai-small-btn ns-ai-account-preview-clear" type="button">清除专用账号缓存</button></div>
+      </div>`;
+    settingsPaneEl.querySelector(".ns-ai-account-preview-enabled").addEventListener("change",e=>{
+      settingsDraft.accountPreview={enabled:e.currentTarget.checked};
+      setSettingsStatus(e.currentTarget.checked?"保存后启用按需账号速览；不会在页面加载时批量读取。":"保存后关闭账号速览；已有画像缓存不会被删除。",e.currentTarget.checked?"warning":"");
+    });
+    settingsPaneEl.querySelector(".ns-ai-account-preview-clear").addEventListener("click",()=>{
+      const removed=clearAccountInfoCache();
+      setSettingsStatus(`✓ 已清除 ${removed} 条专用账号资料缓存；画像与 Trade 结果缓存未受影响。`,"success");
+    });
+  }
+
   function renderSettingsPane(){
     if(!settingsDraft)return;
     if(settingsMainTab==="ai")renderAiPane();
     else if(settingsMainTab==="analysis")renderAnalysisPane();
     else if(settingsMainTab==="prompt")renderPromptPane();
-    else renderImagePane();
+    else if(settingsMainTab==="image")renderImagePane();
+    else renderEnhancementPane();
   }
 
   function positionSettingsDefault(){
@@ -2615,6 +2763,7 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
   function persistSettingsRect(){const r=settingsDialogEl.getBoundingClientRect();saveSettingsUiState({tab:settingsMainTab,rect:{left:r.left,top:r.top,width:r.width,height:r.height}});}
 
   function openSettingsModal(preferredProvider=null,message=""){
+    hideAccountPreview(true);
     settingsDraft=cloneSettings(AI_SETTINGS);settingsOriginalSnapshot=settingsSnapshot(settingsDraft);settingsTabProvider=preferredProvider&&PROVIDER_DEFS[preferredProvider]?preferredProvider:settingsDraft.activeProvider;settingsOverlay.style.display="block";applySettingsUiState();renderSettingsMainTabs();renderSettingsPane();setSettingsStatus(message,message?"warning":"");
   }
   function tryCloseSettings(){if(settingsDirty()&&!confirm("当前配置有未保存的修改。\n\n确定放弃这些修改？"))return;settingsOverlay.style.display="none";settingsDraft=null;setSettingsStatus();}
@@ -2644,7 +2793,10 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
     for (const state of USER_STATES.values()) {
       if (fastChanged && state.fast.status !== "running") state.fast = { status: "idle", task: null, result: null, meta: null, error: "" };
       if (deepChanged && state.deep.status !== "running") state.deep = { status: "idle", task: null, result: null, meta: null, error: "" };
-      updateUidButtons(state.uid);
+      if (fastChanged || deepChanged) {
+        UID_STORAGE_HYDRATED.delete(state.uid);
+        hydrateUidStorageState(state.uid,true);
+      } else updateUidButtons(state.uid);
     }
   }
 
@@ -2665,6 +2817,7 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
     for(const id of Object.keys(PROVIDER_DEFS))settingsDraft.providers[id].apiUrl=normalizeApiUrl(settingsDraft.providers[id].apiUrl,id);
     validateSettingsDraft();
     AI_SETTINGS=saveAiSettings(settingsDraft);rebuildActiveAi();updateProviderMini();
+    if(AI_SETTINGS.accountPreview?.enabled!==true)hideAccountPreview(true);
     const newFastFingerprint=activeConfigFingerprint("fast"),newDeepFingerprint=activeConfigFingerprint("deep");
     invalidateMemoryResults(oldFastFingerprint!==newFastFingerprint,oldDeepFingerprint!==newDeepFingerprint);
     settingsOriginalSnapshot=settingsSnapshot(settingsDraft);persistSettingsRect();settingsOverlay.style.display="none";settingsDraft=null;
@@ -3927,7 +4080,15 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
   function calcJoinDays(createdAt) {
     const d = parseDate(createdAt);
     if (!d) return null;
-    return Math.max(0, Math.floor((Date.now() - d.getTime()) / 86400000));
+    // NodeSeek 展示的是“已进入第几天”的口径；向下取整会稳定比站内少 1 天。
+    return Math.max(0, Math.ceil((Date.now() - d.getTime()) / 86400000));
+  }
+
+  function refreshAccountDerivedFields(account) {
+    if (!account || typeof account !== "object") return account;
+    const joinDays = calcJoinDays(account.createdAt);
+    if (joinDays != null) account.joinDays = joinDays;
+    return account;
   }
 
   function escapeDataForPrompt(obj) {
@@ -4015,6 +4176,7 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
         try { if (typeof GM_deleteValue === "function") GM_deleteValue(key); } catch { /* ignore */ }
         return null;
       }
+      if (obj.account) refreshAccountDerivedFields(obj.account);
       return obj;
     } catch { return null; }
   }
@@ -4023,22 +4185,67 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
     return readCacheByStorageKey(buildLocalCacheKey(prefix, uid), ttl);
   }
 
+  function accountInfoCacheKey(uid) {
+    return `${CONFIG.accountCachePrefix}${String(uid)}`;
+  }
+
+  function readAccountInfoCache(uid) {
+    const cached = readCacheByStorageKey(accountInfoCacheKey(uid), CONFIG.accountCacheTtl);
+    return cached?.account && typeof cached.account === "object" ? cached : null;
+  }
+
+  function writeAccountInfoCache(account, cachedAt = Date.now()) {
+    if (!account?.uid) return;
+    try {
+      const key = accountInfoCacheKey(account.uid);
+      const serialized = JSON.stringify({ time: Number(cachedAt) || Date.now(), account });
+      GM_setValue(key, serialized);
+      sessionStorage.setItem(key, serialized);
+      cleanupPersistentCaches();
+    } catch { /* ignore */ }
+  }
+
+  function clearAccountInfoCache() {
+    const removed = new Set();
+    try {
+      if (typeof GM_listValues === "function" && typeof GM_deleteValue === "function") {
+        for (const key of GM_listValues()) {
+          if (!String(key).startsWith(CONFIG.accountCachePrefix)) continue;
+          GM_deleteValue(key); removed.add(String(key));
+        }
+      }
+    } catch { /* ignore */ }
+    try {
+      const keys = [];
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i);
+        if (String(key || "").startsWith(CONFIG.accountCachePrefix)) keys.push(key);
+      }
+      for (const key of keys) { sessionStorage.removeItem(key); removed.add(String(key)); }
+    } catch { /* ignore */ }
+    return removed.size;
+  }
+
   function cleanupPersistentCaches() {
     if (typeof GM_listValues !== "function" || typeof GM_deleteValue !== "function") return;
     try {
       const now = Date.now();
-      const entries = [];
+      const resultEntries = [];
+      const accountEntries = [];
       for (const key of GM_listValues()) {
         const isFast = String(key).startsWith(CONFIG.fastCachePrefix);
         const isDeep = String(key).startsWith(CONFIG.deepCachePrefix);
-        if (!isFast && !isDeep) continue;
+        const isAccount = String(key).startsWith(CONFIG.accountCachePrefix);
+        if (!isFast && !isDeep && !isAccount) continue;
         const obj = parseStoredJson(GM_getValue(key, null), null);
-        const ttl = isDeep ? CONFIG.deepCacheTtl : CONFIG.fastCacheTtl;
+        const ttl = isAccount ? CONFIG.accountCacheTtl : isDeep ? CONFIG.deepCacheTtl : CONFIG.fastCacheTtl;
         if (!obj?.time || now - Number(obj.time) > ttl) GM_deleteValue(key);
-        else entries.push({ key, time: Number(obj.time) || 0 });
+        else (isAccount ? accountEntries : resultEntries).push({ key, time: Number(obj.time) || 0 });
       }
-      entries.sort((a, b) => b.time - a.time);
-      for (const item of entries.slice(CONFIG.cacheMaxEntries)) GM_deleteValue(item.key);
+      resultEntries.sort((a, b) => b.time - a.time);
+      accountEntries.sort((a, b) => b.time - a.time);
+      for (const item of resultEntries.slice(CONFIG.cacheMaxEntries)) GM_deleteValue(item.key);
+      for (const item of accountEntries.slice(CONFIG.accountCacheMaxEntries)) GM_deleteValue(item.key);
     } catch { /* ignore */ }
   }
 
@@ -4217,16 +4424,84 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
   // 账号硬信息
   // ============================================================
 
-  async function fetchAccountInfo(uid, task = null) {
-    assertTaskActive(task || { cancelled:false, controller:{signal:{aborted:false}} });
-    const res = await safeFetchJson(`/api/account/getInfo/${encodeURIComponent(uid)}`, task?.controller?.signal);
-    if (!res.ok || !res.data) throw new Error(`账号资料读取失败（HTTP ${res.status || "网络错误"}）`);
-    const detail = res.data?.detail || res.data?.data || res.data;
+  const ACCOUNT_INFO_INFLIGHT = new Map();
+  const ACCOUNT_PREVIEW_REQUEST_TIMES = [];
+  let accountPreviewRequestQueue = Promise.resolve();
+  let accountPreviewLastRequestAt = 0;
+  let accountPreviewCooldownUntil = 0;
+
+  function accountPreviewLimitError(message) {
+    const error = new Error(message);
+    error.code = "ACCOUNT_PREVIEW_LIMIT";
+    return error;
+  }
+
+  function accountPreviewCancelledError() {
+    const error = new Error("已取消尚未开始的账号速览请求。");
+    error.code = "ACCOUNT_PREVIEW_CANCELLED";
+    return error;
+  }
+
+  function pruneAccountPreviewRequestTimes(now = Date.now()) {
+    while (ACCOUNT_PREVIEW_REQUEST_TIMES.length && now - ACCOUNT_PREVIEW_REQUEST_TIMES[0] >= CONFIG.accountPreviewRequestWindowMs) {
+      ACCOUNT_PREVIEW_REQUEST_TIMES.shift();
+    }
+  }
+
+  async function acquireAccountPreviewRequestSlot(shouldStart = null) {
+    if (shouldStart && !shouldStart()) throw accountPreviewCancelledError();
+    let now = Date.now();
+    if (now < accountPreviewCooldownUntil) {
+      const seconds = Math.max(1, Math.ceil((accountPreviewCooldownUntil - now) / 1000));
+      throw accountPreviewLimitError(`账号资料请求正在冷却，请约 ${seconds} 秒后再试。`);
+    }
+    pruneAccountPreviewRequestTimes(now);
+    if (ACCOUNT_PREVIEW_REQUEST_TIMES.length >= CONFIG.accountPreviewRequestMaxPerWindow) {
+      const retryAt = ACCOUNT_PREVIEW_REQUEST_TIMES[0] + CONFIG.accountPreviewRequestWindowMs;
+      throw accountPreviewLimitError(`本分钟账号速览请求已达保护上限，请约 ${Math.max(1, Math.ceil((retryAt - now) / 1000))} 秒后再试。`);
+    }
+    const waitMs = Math.max(0, CONFIG.accountPreviewRequestMinGapMs - (now - accountPreviewLastRequestAt));
+    if (waitMs) await sleep(waitMs);
+    if (shouldStart && !shouldStart()) throw accountPreviewCancelledError();
+    now = Date.now();
+    if (now < accountPreviewCooldownUntil) throw accountPreviewLimitError("账号资料请求正在冷却，请稍后再试。");
+    pruneAccountPreviewRequestTimes(now);
+    if (ACCOUNT_PREVIEW_REQUEST_TIMES.length >= CONFIG.accountPreviewRequestMaxPerWindow) {
+      throw accountPreviewLimitError("本分钟账号速览请求已达保护上限，请稍后再试。");
+    }
+    accountPreviewLastRequestAt = now;
+    ACCOUNT_PREVIEW_REQUEST_TIMES.push(now);
+  }
+
+  function queueAccountPreviewRequest(request, shouldStart = null) {
+    const queued = accountPreviewRequestQueue.then(async () => {
+      await acquireAccountPreviewRequestSlot(shouldStart);
+      return request();
+    });
+    accountPreviewRequestQueue = queued.catch(() => undefined);
+    return queued;
+  }
+
+  function normalizeAccountInfo(uid, data) {
+    const detail = data?.detail || data?.data || data;
     if (!detail || typeof detail !== "object") throw new Error("账号资料接口返回格式异常");
 
     const coin = Number(detail.coin || 0);
     let rank = Number(detail.rank);
     if (!Number.isFinite(rank)) rank = Math.min(6, Math.floor(Math.sqrt(Math.max(0, coin)) / 10));
+
+    const optionalCount = (keys) => {
+      for (const key of keys) {
+        if (!Object.prototype.hasOwnProperty.call(detail,key)) continue;
+        const raw = detail[key];
+        if (raw == null || raw === "" || typeof raw === "boolean") continue;
+        const candidate = Array.isArray(raw) ? raw.length : (raw && typeof raw === "object" ? raw.count ?? raw.total : raw);
+        if (candidate == null || candidate === "" || typeof candidate === "boolean") continue;
+        const count = Number(candidate);
+        if (Number.isFinite(count) && count >= 0) return Math.floor(count);
+      }
+      return null;
+    };
 
     return {
       uid: String(uid),
@@ -4238,10 +4513,73 @@ sections 最多 6 个，每栏 items 最多 6 条。不要为了填满格式制�
       joinDays: calcJoinDays(detail.created_at),
       nPost: Number(detail.nPost || detail.n_post || 0),
       nComment: Number(detail.nComment || detail.n_comment || 0),
+      following: optionalCount(["following_count","followingCount","nFollowing","n_following","followings","following"]),
+      followers: optionalCount(["follower_count","followers_count","followerCount","nFollowers","n_followers","fans_count","fansCount","nFans","followers","fans"]),
     };
   }
 
+  function awaitAccountInfoConsumer(promise, task = null) {
+    if (!task) return promise;
+    assertTaskActive(task);
+    return new Promise((resolve, reject) => {
+      const signal = task.controller?.signal;
+      const onAbort = () => reject(abortError());
+      signal?.addEventListener?.("abort", onAbort, { once:true });
+      promise.then(resolve, reject).finally(() => signal?.removeEventListener?.("abort", onAbort));
+    });
+  }
+
+  async function fetchAccountInfo(uid, task = null, options = {}) {
+    uid = String(uid);
+    if (task) assertTaskActive(task);
+    const purpose = options?.purpose === "preview" ? "preview" : "analysis";
+    const force = options?.force === true;
+    const previewShouldStart = typeof options?.shouldStart === "function" ? options.shouldStart : null;
+    if (!force) {
+      const cached = readAccountInfoCache(uid);
+      if (cached?.account) return cached.account;
+    }
+
+    const existing = ACCOUNT_INFO_INFLIGHT.get(uid);
+    if (existing) {
+      try {
+        const account = await awaitAccountInfoConsumer(existing.promise, task);
+        if (task) assertTaskActive(task);
+        return account;
+      } catch (error) {
+        if (purpose !== "preview" && existing.purpose === "preview" && ["ACCOUNT_PREVIEW_LIMIT","ACCOUNT_PREVIEW_CANCELLED"].includes(error?.code)) {
+          if (ACCOUNT_INFO_INFLIGHT.get(uid) === existing) ACCOUNT_INFO_INFLIGHT.delete(uid);
+          return fetchAccountInfo(uid, task, { ...options, purpose: "analysis" });
+        }
+        throw error;
+      }
+    }
+
+    const request = async () => {
+      const res = await safeFetchJson(`/api/account/getInfo/${encodeURIComponent(uid)}`);
+      if (res.status === 403 || res.status === 429) {
+        accountPreviewCooldownUntil = Math.max(accountPreviewCooldownUntil, Date.now() + CONFIG.accountPreviewCooldownMs);
+      }
+      if (!res.ok || !res.data) throw new Error(`账号资料读取失败（HTTP ${res.status || "网络错误"}）`);
+      const account = normalizeAccountInfo(uid, res.data);
+      writeAccountInfoCache(account);
+      return account;
+    };
+    const promise = purpose === "preview" ? queueAccountPreviewRequest(request,previewShouldStart) : request();
+    const record = { promise, purpose };
+    ACCOUNT_INFO_INFLIGHT.set(uid, record);
+    promise.then(() => {
+      if (ACCOUNT_INFO_INFLIGHT.get(uid) === record) ACCOUNT_INFO_INFLIGHT.delete(uid);
+    }, () => {
+      if (ACCOUNT_INFO_INFLIGHT.get(uid) === record) ACCOUNT_INFO_INFLIGHT.delete(uid);
+    });
+    const account = await awaitAccountInfoConsumer(promise, task);
+    if (task) assertTaskActive(task);
+    return account;
+  }
+
   function renderAccount(account) {
+    refreshAccountDerivedFields(account);
     lastAccount = account;
     accountEl.style.display = "block";
     accountEl.textContent = "";
@@ -5266,7 +5604,7 @@ ${customPreset ? "请围绕 custom_goal 分析，并遵守 system 中不可覆�
 
       if (currentUid === uid && activeMode === "fast") { accountEl.style.display = "none"; contentEl.textContent = ""; }
       taskShowProgress(task, "① 读取账号资料…", 5, [{ state: "active", text: "读取等级、注册时间、鸡腿、星辰和历史总量" }]);
-      const account = await fetchAccountInfo(uid, task);
+      const account = refreshAccountDerivedFields(await fetchAccountInfo(uid, task, { force }));
       state.account = account;
       if (currentUid === uid) renderAccount(account);
 
@@ -5812,7 +6150,7 @@ ${escapeDataForPrompt(payload)}
       if(!force){const cached=readCache(CONFIG.deepCachePrefix,uid,CONFIG.deepCacheTtl);if(cached?.report&&cached?.meta&&cached?.account){state.account=cached.account;if(currentUid===uid)renderAccount(cached.account);renderDeepTrade(cached.report,{...cached.meta,localCacheHit:true,openDurationMs:Date.now()-task.startedAt},cached.account,uid);finishTask(task,"done");return;}}
       else clearCache(CONFIG.deepCachePrefix,uid);
 
-      const account=state.account||await fetchAccountInfo(uid,task);state.account=account;if(currentUid===uid)renderAccount(account);
+      const account=refreshAccountDerivedFields(state.account||await fetchAccountInfo(uid,task));state.account=account;if(currentUid===uid)renderAccount(account);
       taskShowProgress(task,"① 按配置扩大历史范围…",5,[{state:"done",text:`账号资料 · Lv${account.rank} · ${account.joinDays??"?"}天`},{state:"active",text:`${samplingStrategyLabel(cfg.strategy)} · 主题最多 ${cfg.discussionPages} 页 + 评论最多 ${cfg.commentPages} 页`}],"深度模式会读取更多公开历史；提高页数和样本上限会增加等待时间与 Token。" );
       const history=await fetchHistoryByAnalysisConfig(uid,account,cfg,(pp)=>{const total=Math.max(1,pp.total||cfg.discussionPages+cfg.commentPages);taskShowProgress(task,"① 按配置扩大历史范围…",5+Math.round((Math.min(pp.done,total)/total)*28),[{state:"done",text:`账号资料 · Lv${account.rank} · ${account.joinDays??"?"}天`},{state:"active",text:`历史页面 ${Math.min(pp.done,total)} / ${total}${pp.failed?` · ${pp.failed} 个失败`:""}`}],`主题页：${pp.dPages?.join(", ")||"规划中"}；评论页：${pp.cPages?.join(", ")||"规划中"}`);},task);
 
@@ -5888,6 +6226,7 @@ ${escapeDataForPrompt(payload)}
       slot.status = "running";
       slot.error = "";
       slot.task = externalTaskSnapshot(record);
+      scheduleTaskBridgePoll();
       if (render && changed && taskIsCurrent(slot.task)) {
         if (!alreadyShowingRun) { contentEl.textContent = ""; metaEl.textContent = ""; }
         renderTaskSnapshot(slot.task);
@@ -5913,7 +6252,7 @@ ${escapeDataForPrompt(payload)}
       } else {
         slot.status = "error";
         slot.error = "临时任务已结束，但没有找到对应的本地结果缓存。请重新生成。";
-        if (render && changed) renderError(slot.error, record.mode, record.uid);
+        if (render && changed && currentUid === String(record.uid) && activeMode === record.mode) renderError(slot.error, record.mode, record.uid);
       }
     } else if (record.status === "cancelled") {
       slot.task = null;
@@ -5924,14 +6263,104 @@ ${escapeDataForPrompt(payload)}
       slot.task = null;
       slot.status = "error";
       slot.error = record.error || "临时任务执行失败。";
-      if (render && changed) renderError(slot.error, record.mode, record.uid);
+      if (render && changed && currentUid === String(record.uid) && activeMode === record.mode) renderError(slot.error, record.mode, record.uid);
     }
     updateUidButtons(record.uid);
+    if (!isPersistentTaskActive(record)) releaseDetachedUidState(record.uid);
+  }
+
+  function clearPersistentTaskSlot(uid, mode, expectedId = "") {
+    uid = String(uid);
+    const state = USER_STATES.get(uid);
+    if (!state) return;
+    const slot = state[mode];
+    if (!slot) return;
+    if (expectedId && slot.externalJobId && slot.externalJobId !== expectedId) return;
+    const wasExternal = slot.task?.external === true;
+    if (wasExternal) slot.task = null;
+    if (slot.status === "running" && wasExternal) slot.status = slot.result ? "done" : "idle";
+    slot.externalJobId = "";
+    slot.externalRevision = "";
+    updateUidButtons(uid);
+    releaseDetachedUidState(uid);
+  }
+
+  function syncPersistentTaskSlot(uid, mode, render = true, expectedId = "", deleted = false) {
+    uid = String(uid);
+    mode = mode === "deep" ? "deep" : "fast";
+    if (deleted) {
+      clearPersistentTaskSlot(uid, mode, expectedId);
+      return null;
+    }
+    const record = cleanupPersistentTaskRecord(readPersistentTask(uid, mode));
+    if (!record) {
+      clearPersistentTaskSlot(uid, mode, expectedId);
+      return null;
+    }
+    // 旧广播晚到时，不允许它覆盖同一槽位里更新的任务。
+    if (expectedId && record.id !== expectedId) return null;
+    attachPersistentTask(record, render);
+    return record;
   }
 
   function syncPersistentTasks(render = true) {
-    cleanupPersistentTasks();
-    for (const record of listPersistentTasks()) attachPersistentTask(record, render);
+    const records = cleanupPersistentTasks(listPersistentTasks());
+    for (const record of records) attachPersistentTask(record, render);
+    return records;
+  }
+
+  function persistentTaskSignalRelevant(signal) {
+    if (!signal?.uid || !["fast", "deep"].includes(signal.mode)) return false;
+    const uid = String(signal.uid);
+    const slot = USER_STATES.get(uid)?.[signal.mode];
+    return currentUid === uid
+      || uidHasConnectedProfileButton(uid)
+      || (slot?.externalJobId && (!signal.id || slot.externalJobId === signal.id))
+      || (slot?.task?.external === true && slot.status === "running");
+  }
+
+  function handlePersistentTaskSignal(rawSignal, render = true) {
+    const signal = typeof rawSignal === "string" ? parseStoredJson(rawSignal, {}) : (rawSignal || {});
+    if (!persistentTaskSignalRelevant(signal)) return;
+    const key = taskSlotKey(signal.uid, signal.mode);
+    if (document.hidden) {
+      DEFERRED_TASK_SIGNALS.set(key, signal);
+      return;
+    }
+    DEFERRED_TASK_SIGNALS.delete(key);
+    syncPersistentTaskSlot(String(signal.uid), signal.mode, render, String(signal.id || ""), signal.deleted === true);
+  }
+
+  function syncTrackedPersistentTasks(render = true) {
+    if (document.hidden) return;
+    for (const state of USER_STATES.values()) {
+      for (const mode of ["fast", "deep"]) {
+        const slot = state[mode];
+        if (slot?.status !== "running" || slot?.task?.external !== true) continue;
+        syncPersistentTaskSlot(state.uid, mode, render, String(slot.externalJobId || slot.task.id || ""));
+      }
+    }
+  }
+
+  function hasTrackedPersistentTasks() {
+    for (const state of USER_STATES.values()) {
+      for (const mode of ["fast", "deep"]) {
+        const slot = state[mode];
+        if (slot?.status === "running" && slot?.task?.external === true) return true;
+      }
+    }
+    return false;
+  }
+
+  function scheduleTaskBridgePoll() {
+    if (IS_TASK_WORKER || taskBridgePollTimer != null || !hasTrackedPersistentTasks()) return;
+    const delay = taskBridgeListenerInstalled ? CONFIG.taskBridgeWatchdogPollMs : CONFIG.taskBridgeFallbackPollMs;
+    taskBridgePollTimer = setTimeout(() => {
+      taskBridgePollTimer = null;
+      if (document.hidden) return;
+      syncTrackedPersistentTasks(true);
+      scheduleTaskBridgePoll();
+    }, delay);
   }
 
   function taskWorkerUrl() {
@@ -6010,7 +6439,7 @@ ${escapeDataForPrompt(payload)}
       return null;
     }
 
-    const existing = readPersistentTask(uid, mode);
+    const existing = cleanupPersistentTaskRecord(readPersistentTask(uid, mode));
     if (isPersistentTaskActive(existing)) {
       attachPersistentTask(existing, true);
       return externalTaskSnapshot(existing);
@@ -6051,9 +6480,57 @@ ${escapeDataForPrompt(payload)}
   const WORKER_STARTING_JOB_IDS = new Set();
   const WORKER_SEEN_JOB_IDS = new Set();
   const WORKER_OPENED_AT = Date.now();
+  const WORKER_RECORD_CACHE = new Map();
   let workerHasSeenTask = false;
   let workerIdleSince = 0;
   let workerShellEl = null;
+  let workerShellRevision = "";
+  let workerLastFullScanAt = 0;
+  let workerValueListenerInstalled = false;
+  let workerTickTimer = null;
+  let workerClosing = false;
+
+  function rememberWorkerRecord(record) {
+    if (!record?.uid || !["fast", "deep"].includes(record.mode)) return;
+    WORKER_RECORD_CACHE.set(taskSlotKey(record.uid, record.mode), record);
+  }
+
+  function forgetWorkerRecord(uid, mode) {
+    WORKER_RECORD_CACHE.delete(taskSlotKey(uid, mode));
+  }
+
+  function cachedWorkerRecords() {
+    return Array.from(WORKER_RECORD_CACHE.values());
+  }
+
+  function workerRecordOwnedOrClaimable(record) {
+    if (!record) return false;
+    return record.status === "queued"
+      || !record.workerId
+      || record.workerId === WORKER_INSTANCE_ID
+      || WORKER_STARTING_JOB_IDS.has(record.id)
+      || WORKER_RUNTIME_TASKS.has(record.id);
+  }
+
+  function refreshWorkerRecordCache(force = false) {
+    if (!IS_TASK_WORKER) return [];
+    const now = Date.now();
+    const interval = workerValueListenerInstalled ? CONFIG.taskWorkerWatchdogScanMs : CONFIG.taskWorkerFallbackScanMs;
+    if (!force && now - workerLastFullScanAt < interval) return cachedWorkerRecords();
+    workerLastFullScanAt = now;
+    const records = cleanupPersistentTasks(listPersistentTasks());
+    const seen = new Set();
+    for (const record of records) {
+      const key = taskSlotKey(record.uid, record.mode);
+      seen.add(key);
+      rememberWorkerRecord(record);
+      processWorkerPersistentRecord(record);
+    }
+    for (const key of Array.from(WORKER_RECORD_CACHE.keys())) {
+      if (!seen.has(key)) WORKER_RECORD_CACHE.delete(key);
+    }
+    return cachedWorkerRecords();
+  }
 
   async function claimAndRunPersistentTask(record) {
     if (!IS_TASK_WORKER || !record?.id || WORKER_STARTING_JOB_IDS.has(record.id) || WORKER_RUNTIME_TASKS.has(record.id)) return;
@@ -6127,9 +6604,18 @@ ${escapeDataForPrompt(payload)}
     }
   }
 
-  function renderTaskWorkerShell(records = listPersistentTasks()) {
+  function renderTaskWorkerShell(records = cachedWorkerRecords()) {
     if (!workerShellEl) return;
-    const active = records.filter(isPersistentTaskActive);
+    const active = records.filter((record) => isPersistentTaskActive(record) && workerRecordOwnedOrClaimable(record));
+    const revision = JSON.stringify(active.map((record) => ({
+      id: record.id,
+      status: record.status,
+      name: record.accountName || "",
+      title: record.progress?.title || "",
+      percent: Math.max(0, Math.min(100, Number(record.progress?.percent) || 0)),
+    })));
+    if (revision === workerShellRevision) return;
+    workerShellRevision = revision;
     const rows = active.length ? active.map((record) => {
       const percent = Math.max(0, Math.min(100, Number(record.progress?.percent) || 0));
       const label = record.mode === "deep" ? "深度交易" : "快速画像";
@@ -6144,8 +6630,8 @@ ${escapeDataForPrompt(payload)}
 
   function processWorkerPersistentRecord(record) {
     if (!IS_TASK_WORKER || !record?.id) return;
-    const cancelRequested = record.cancelRequested || hasPersistentTaskCancelIntent(record);
     if (record.status === "queued") {
+      const cancelRequested = record.cancelRequested || hasPersistentTaskCancelIntent(record);
       if (cancelRequested) {
         writePersistentTask({ ...record, status: "cancelled", cancelRequested: true, error: "已由用户终止查询；任务尚未调用模型。", finishedAt: Date.now(), updatedAt: Date.now() });
         return;
@@ -6154,6 +6640,8 @@ ${escapeDataForPrompt(payload)}
       claimAndRunPersistentTask(record);
       return;
     }
+    if (!isPersistentTaskActive(record)) return;
+    const cancelRequested = record.cancelRequested || hasPersistentTaskCancelIntent(record);
     if (record.status === "cancelling" || cancelRequested) {
       const runtimeTask = WORKER_RUNTIME_TASKS.get(record.id);
       if (runtimeTask && !runtimeTask.cancelled) {
@@ -6172,36 +6660,68 @@ ${escapeDataForPrompt(payload)}
 
   function wakeTaskWorker(uid, mode, expectedId = "") {
     if (!IS_TASK_WORKER || !uid || !["fast", "deep"].includes(mode)) return;
-    const record = readPersistentTask(uid, mode);
+    const record = cleanupPersistentTaskRecord(readPersistentTask(uid, mode));
     if (!record || (expectedId && record.id !== expectedId)) return;
+    workerClosing = false;
+    rememberWorkerRecord(record);
     processWorkerPersistentRecord(record);
-    renderTaskWorkerShell();
+    renderTaskWorkerShell(cachedWorkerRecords());
+    ensureWorkerTicking();
   }
 
-  function workerTick() {
+  function ensureWorkerTicking() {
+    if (!IS_TASK_WORKER || workerTickTimer != null) return;
+    workerTickTimer = setInterval(workerTick, CONFIG.taskWorkerTickMs);
+  }
+
+  function stopWorkerTicking() {
+    if (workerTickTimer == null) return;
+    clearInterval(workerTickTimer);
+    workerTickTimer = null;
+  }
+
+  function workerTick(forceScan = false) {
     if (!IS_TASK_WORKER) return;
-    cleanupPersistentTasks();
-    const records = listPersistentTasks();
+    if (forceScan) refreshWorkerRecordCache(true);
+    else refreshWorkerRecordCache(false);
     for (const [jobId, task] of WORKER_RUNTIME_TASKS) {
-      const record = records.find((item) => item.id === jobId);
+      const record = WORKER_RECORD_CACHE.get(taskSlotKey(task.uid, task.mode));
       if (record?.cancelRequested && !task.cancelled) cancelTask(task);
       else if (record && isPersistentTaskActive(record)) persistBoundTaskProgress(task);
     }
-    for (const record of records) processWorkerPersistentRecord(record);
+    let records = cachedWorkerRecords();
     renderTaskWorkerShell(records);
-    const active = records.some(isPersistentTaskActive) || WORKER_STARTING_JOB_IDS.size > 0 || WORKER_RUNTIME_TASKS.size > 0;
+    let active = records.some((record) => isPersistentTaskActive(record) && workerRecordOwnedOrClaimable(record)) || WORKER_STARTING_JOB_IDS.size > 0 || WORKER_RUNTIME_TASKS.size > 0;
+    const reachedNeverUsedDeadline = !workerHasSeenTask && Date.now() - WORKER_OPENED_AT > 15000;
+    // 广播和 postMessage 都漏掉的极端情况下，关闭前再全量确认一次，避免遗漏刚排队的第二个任务。
+    if (!active && ((!workerIdleSince && workerHasSeenTask) || reachedNeverUsedDeadline)) {
+      records = refreshWorkerRecordCache(true);
+      renderTaskWorkerShell(records);
+      active = records.some((record) => isPersistentTaskActive(record) && workerRecordOwnedOrClaimable(record)) || WORKER_STARTING_JOB_IDS.size > 0 || WORKER_RUNTIME_TASKS.size > 0;
+    }
     if (active) { workerHasSeenTask = true; workerIdleSince = 0; }
     else if (workerHasSeenTask) {
       if (!workerIdleSince) workerIdleSince = Date.now();
-      if (Date.now() - workerIdleSince > 6000) window.close();
-    } else if (Date.now() - WORKER_OPENED_AT > 15000) window.close();
+      if (Date.now() - workerIdleSince > 6000 && !workerClosing) {
+        workerClosing = true;
+        stopWorkerTicking();
+        window.close();
+      }
+    } else if (Date.now() - WORKER_OPENED_AT > 15000 && !workerClosing) {
+      workerClosing = true;
+      stopWorkerTicking();
+      window.close();
+    }
   }
 
   function markWorkerTasksInterrupted() {
     if (!IS_TASK_WORKER) return;
     const now = Date.now();
     for (const record of listPersistentTasks()) {
-      const owned = record.workerId === WORKER_INSTANCE_ID || WORKER_SEEN_JOB_IDS.has(record.id) || WORKER_STARTING_JOB_IDS.has(record.id) || WORKER_RUNTIME_TASKS.has(record.id);
+      const owned = record.workerId === WORKER_INSTANCE_ID
+        || (record.status === "queued" && WORKER_SEEN_JOB_IDS.has(record.id))
+        || WORKER_STARTING_JOB_IDS.has(record.id)
+        || WORKER_RUNTIME_TASKS.has(record.id);
       if (!owned || !isPersistentTaskActive(record)) continue;
       writePersistentTask({
         ...record,
@@ -6254,25 +6774,268 @@ ${escapeDataForPrompt(payload)}
       try {
         GM_addValueChangeListener(CONFIG.taskSignalKey, (_key, _oldValue, newValue) => {
           const signal = parseStoredJson(newValue, {});
-          if (signal?.uid && ["fast", "deep"].includes(signal.mode)) wakeTaskWorker(String(signal.uid), signal.mode, String(signal.id || ""));
-          else workerTick();
+          if (signal?.uid && ["fast", "deep"].includes(signal.mode)) {
+            if (signal.deleted === true) {
+              forgetWorkerRecord(String(signal.uid), signal.mode);
+              renderTaskWorkerShell(cachedWorkerRecords());
+            } else wakeTaskWorker(String(signal.uid), signal.mode, String(signal.id || ""));
+          } else workerTick(true);
         });
-      } catch { /* 500ms 轮询仍是兜底 */ }
+        workerValueListenerInstalled = true;
+      } catch { /* 低频全量扫描仍是兜底 */ }
     }
     window.addEventListener("pagehide", markWorkerTasksInterrupted);
-    setInterval(workerTick, 500);
-    workerTick();
+    workerTick(true);
+    ensureWorkerTicking();
   }
 
   function initializeTaskBridge() {
-    cleanupPersistentCaches();
-    cleanupPersistentTasks();
-    syncPersistentTasks(false);
+    taskBridgeListenerInstalled = false;
     if (typeof GM_addValueChangeListener === "function") {
-      try { GM_addValueChangeListener(CONFIG.taskSignalKey, () => syncPersistentTasks(true)); } catch { /* ignore */ }
+      try {
+        GM_addValueChangeListener(CONFIG.taskSignalKey, (_key, _oldValue, newValue) => handlePersistentTaskSignal(newValue, true));
+        taskBridgeListenerInstalled = true;
+      } catch { /* 仅在监听不可用时启用定向轮询 */ }
     }
-    setInterval(() => syncPersistentTasks(true), CONFIG.taskSyncIntervalMs);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) return;
+      const pending = Array.from(DEFERRED_TASK_SIGNALS.values());
+      DEFERRED_TASK_SIGNALS.clear();
+      for (const signal of pending) handlePersistentTaskSignal(signal, true);
+      syncTrackedPersistentTasks(true);
+      scheduleTaskBridgePoll();
+    });
   }
+
+
+  // ============================================================
+  // 按需账号速览：默认关闭、缓存复用、Nodeseek Pro 兼容保护
+  // ============================================================
+
+  const accountPreviewEl = document.createElement("div");
+  accountPreviewEl.id = "ns-ai-account-preview";
+  accountPreviewEl.setAttribute("role", "tooltip");
+  accountPreviewEl.setAttribute("aria-live", "polite");
+  accountPreviewEl.setAttribute("aria-hidden", "true");
+  if (!IS_TASK_WORKER) document.body.appendChild(accountPreviewEl);
+
+  let accountPreviewShowTimer = null;
+  let accountPreviewHideTimer = null;
+  let accountPreviewGeneration = 0;
+  let accountPreviewTarget = null;
+
+  function accountPreviewSupported() {
+    if (AI_SETTINGS.accountPreview?.enabled !== true || IS_TASK_WORKER) return false;
+    try { return !window.matchMedia("(hover: none), (pointer: coarse)").matches; }
+    catch { return true; }
+  }
+
+  function reusableAccountForPreview(uid) {
+    uid = String(uid);
+    const dedicated = readAccountInfoCache(uid);
+    if (dedicated?.account) return dedicated.account;
+    const fast = readCache(CONFIG.fastCachePrefix, uid, CONFIG.fastCacheTtl);
+    if (fast?.account) return fast.account;
+    const deep = readCache(CONFIG.deepCachePrefix, uid, CONFIG.deepCacheTtl);
+    if (deep?.account) return deep.account;
+    return null;
+  }
+
+  function inspectNodeseekProOwner(authorEl) {
+    const scope = authorEl?.closest?.(".nsk-content-meta-info") || authorEl?.closest?.(".author-info") || authorEl?.parentElement;
+    const display = scope?.querySelector?.(".nsx-user-info-display") || null;
+    const claimed = authorEl?.dataset?.nsxInfoLoaded === "1";
+    return { detected: claimed || !!display, claimed, display };
+  }
+
+  function previewNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toLocaleString("zh-CN") : "—";
+  }
+
+  function accountPreviewLevelClass(value) {
+    const rank = Math.max(0, Math.min(6, Math.floor(Number(value) || 0)));
+    return `ns-ai-rank-${rank}`;
+  }
+
+  function accountPreviewMetricTone(kind, value) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < 0) return "ns-ai-tone-muted";
+    if (kind === "age") {
+      if (number <= 7) return "ns-ai-tone-rose";
+      if (number <= 30) return "ns-ai-tone-orange";
+      if (number <= 180) return "ns-ai-tone-cyan";
+      if (number <= 365) return "ns-ai-tone-blue";
+      if (number <= 730) return "ns-ai-tone-green";
+      if (number <= 1460) return "ns-ai-tone-violet";
+      return "ns-ai-tone-gold";
+    }
+    if (kind === "coin") {
+      if (number < 100) return "ns-ai-tone-rose";
+      if (number < 400) return "ns-ai-tone-orange";
+      if (number < 900) return "ns-ai-tone-amber";
+      if (number < 1600) return "ns-ai-tone-cyan";
+      if (number < 2500) return "ns-ai-tone-blue";
+      if (number < 3600) return "ns-ai-tone-green";
+      if (number < 8000) return "ns-ai-tone-violet";
+      return "ns-ai-tone-gold";
+    }
+    if (number <= 0) return "ns-ai-tone-muted";
+    if (number < 10) return "ns-ai-tone-cyan";
+    if (number < 50) return "ns-ai-tone-blue";
+    if (number < 100) return "ns-ai-tone-violet";
+    if (number < 500) return "ns-ai-tone-magenta";
+    return "ns-ai-tone-gold";
+  }
+
+  function positionAccountPreview(button) {
+    if (!button?.isConnected || !accountPreviewEl.isConnected || accountPreviewEl.style.display === "none") return;
+    const rect = button.getBoundingClientRect();
+    const width = accountPreviewEl.offsetWidth || Math.min(300, window.innerWidth - 16);
+    const height = accountPreviewEl.offsetHeight || 220;
+    const left = clamp(rect.left, 8, Math.max(8, window.innerWidth - width - 8));
+    let top = rect.bottom + 8;
+    if (top + height > window.innerHeight - 8 && rect.top >= height + 8) top = rect.top - height - 8;
+    accountPreviewEl.style.left = `${left}px`;
+    accountPreviewEl.style.top = `${clamp(top, 8, Math.max(8, window.innerHeight - height - 8))}px`;
+    accountPreviewEl.style.visibility = "visible";
+  }
+
+  function showAccountPreviewHtml(html, button) {
+    accountPreviewEl.innerHTML = html;
+    accountPreviewEl.setAttribute("aria-hidden","false");
+    accountPreviewEl.style.visibility = "hidden";
+    accountPreviewEl.style.display = "block";
+    positionAccountPreview(button);
+  }
+
+  function renderFullAccountPreview(account, button, fallbackName = "") {
+    refreshAccountDerivedFields(account);
+    const name = safeString(account?.name || fallbackName || `UID ${account?.uid || ""}`, "未知用户", 80) || "未知用户";
+    const encodedUid = encodeURIComponent(String(account?.uid || ""));
+    const discussionsUrl = `/space/${encodedUid}#/discussions`;
+    const commentsUrl = `/space/${encodedUid}#/comments`;
+    const messageUrl = `/notification#/message?mode=talk&to=${encodedUid}`;
+    const joinDays = account?.joinDays == null ? null : Number(account.joinDays);
+    const stats = [
+      { label:"注册天数", value:joinDays == null ? "—" : previewNumber(joinDays), suffix:joinDays == null ? "" : "天", tone:accountPreviewMetricTone("age",joinDays) },
+      { label:"🍗 鸡腿", value:previewNumber(account?.coin), suffix:"", tone:accountPreviewMetricTone("coin",account?.coin) },
+      { label:"✨ 星尘", value:previewNumber(account?.stardust), suffix:"", tone:accountPreviewMetricTone("stardust",account?.stardust) },
+    ];
+    const social = [];
+    if (account?.following != null && Number.isFinite(Number(account.following))) social.push(["关注",previewNumber(account.following)]);
+    if (account?.followers != null && Number.isFinite(Number(account.followers))) social.push(["粉丝",previewNumber(account.followers)]);
+    showAccountPreviewHtml(`
+      <div class="ns-ai-account-preview-head"><div class="ns-ai-account-preview-name">${escapeHtml(name)}</div><div class="ns-ai-account-preview-level ${accountPreviewLevelClass(account?.rank)}">Lv${previewNumber(account?.rank)}</div></div>
+      <div class="ns-ai-account-preview-meta">UID ${escapeHtml(String(account?.uid || "—"))}</div>
+      <div class="ns-ai-account-preview-grid">${stats.map(({label,value,suffix,tone})=>`<div class="ns-ai-account-preview-stat ${tone}"><span class="ns-ai-account-preview-value">${escapeHtml(value)}${suffix?`<small>${escapeHtml(suffix)}</small>`:""}</span><span class="ns-ai-account-preview-label">${escapeHtml(label)}</span></div>`).join("")}</div>
+      <div class="ns-ai-account-preview-activity"><a href="${escapeHtml(discussionsUrl)}" target="_blank" rel="noopener noreferrer" title="查看 ${escapeHtml(name)} 的主题"><strong>${escapeHtml(previewNumber(account?.nPost))}</strong>主题</a><a href="${escapeHtml(commentsUrl)}" target="_blank" rel="noopener noreferrer" title="查看 ${escapeHtml(name)} 的评论"><strong>${escapeHtml(previewNumber(account?.nComment))}</strong>评论</a><a class="ns-ai-account-preview-message" href="${escapeHtml(messageUrl)}" target="_blank" rel="noopener noreferrer" title="私信 ${escapeHtml(name)}">✉ 私信</a></div>
+      ${social.length?`<div class="ns-ai-account-preview-social">${social.map(([label,value])=>`<span>${escapeHtml(label)} <strong>${escapeHtml(value)}</strong></span>`).join("")}</div>`:""}`, button);
+  }
+
+  function renderNodeseekProCompatibility(authorEl, uid, button, generation) {
+    const pro = inspectNodeseekProOwner(authorEl);
+    const name = safeString(authorEl?.textContent, `UID ${uid}`, 80) || `UID ${uid}`;
+    const badge = safeString(pro.display?.textContent, "", 80).replace(/\s+/g, " ").trim();
+    showAccountPreviewHtml(`
+      <div class="ns-ai-account-preview-head"><div class="ns-ai-account-preview-name">${escapeHtml(name)}</div>${badge?`<div class="ns-ai-account-preview-level">${escapeHtml(badge)}</div>`:""}</div>
+      <div class="ns-ai-account-preview-meta">UID ${escapeHtml(String(uid))}</div>
+      <div class="ns-ai-account-preview-note compat">检测到 Nodeseek Pro 已接管或正在读取该作者资料。为避免重复访问相同接口，本脚本没有自动请求。${pro.display?"可悬停其等级标签查看现有详情。":"若它未显示资料，可能仍在排队、功能已关闭或请求失败。"}</div>
+      <button class="ns-ai-account-preview-action" type="button">仍由本脚本加载一次</button>`, button);
+    accountPreviewEl.querySelector(".ns-ai-account-preview-action")?.addEventListener("click",e=>{
+      e.preventDefault(); e.stopPropagation();
+      if(generation!==accountPreviewGeneration)return;
+      startAccountPreview(authorEl,uid,button,{overridePro:true});
+    });
+  }
+
+  function renderAccountPreviewError(error, uid, button, fallbackName = "") {
+    const name=safeString(fallbackName,`UID ${uid}`,80)||`UID ${uid}`;
+    showAccountPreviewHtml(`
+      <div class="ns-ai-account-preview-head"><div class="ns-ai-account-preview-name">${escapeHtml(name)}</div></div>
+      <div class="ns-ai-account-preview-meta">UID ${escapeHtml(String(uid))}</div>
+      <div class="ns-ai-account-preview-note compat">${escapeHtml(error?.message || "账号资料暂时无法读取。")} 本脚本不会自动重试，避免产生重复请求。</div>`,button);
+  }
+
+  async function startAccountPreview(authorEl, uid, button, { overridePro = false } = {}) {
+    if (!accountPreviewSupported() || !button?.isConnected) return;
+    clearTimeout(accountPreviewShowTimer); clearTimeout(accountPreviewHideTimer);
+    const generation = ++accountPreviewGeneration;
+    accountPreviewTarget = { authorEl, uid:String(uid), button };
+    const reusable = reusableAccountForPreview(uid);
+    if (reusable) {
+      renderFullAccountPreview(reusable,button,authorEl?.textContent || "");
+      return;
+    }
+    const pro = inspectNodeseekProOwner(authorEl);
+    if (pro.detected && !overridePro) {
+      renderNodeseekProCompatibility(authorEl,uid,button,generation);
+      return;
+    }
+    showAccountPreviewHtml(`
+      <div class="ns-ai-account-preview-head"><div class="ns-ai-account-preview-name">${escapeHtml(safeString(authorEl?.textContent,`UID ${uid}`,80)||`UID ${uid}`)}</div></div>
+      <div class="ns-ai-account-preview-meta">正在按需读取公开账号资料…</div>
+      <div class="ns-ai-account-preview-note">请求只会发送一次；移开鼠标后若请求已经开始，结果仍会写入本地缓存，避免下次重复读取。</div>`,button);
+    try {
+      const shouldStart=()=>generation===accountPreviewGeneration&&accountPreviewTarget?.button===button;
+      const account = await fetchAccountInfo(uid,null,{purpose:"preview",shouldStart});
+      if(generation!==accountPreviewGeneration||accountPreviewTarget?.button!==button)return;
+      renderFullAccountPreview(account,button,authorEl?.textContent || "");
+    } catch(error) {
+      if(generation!==accountPreviewGeneration||accountPreviewTarget?.button!==button)return;
+      renderAccountPreviewError(error,uid,button,authorEl?.textContent || "");
+    }
+  }
+
+  function scheduleAccountPreview(authorEl, uid, button) {
+    if (!accountPreviewSupported()) return;
+    clearTimeout(accountPreviewShowTimer); clearTimeout(accountPreviewHideTimer);
+    accountPreviewShowTimer=setTimeout(()=>startAccountPreview(authorEl,uid,button),CONFIG.accountPreviewHoverDelayMs);
+  }
+
+  function hideAccountPreview(immediate = false) {
+    clearTimeout(accountPreviewShowTimer); clearTimeout(accountPreviewHideTimer);
+    const hide=()=>{
+      accountPreviewEl.style.display="none";
+      accountPreviewEl.style.visibility="hidden";
+      accountPreviewEl.setAttribute("aria-hidden","true");
+      accountPreviewTarget=null;
+      accountPreviewGeneration++;
+    };
+    if(immediate)hide();
+    else accountPreviewHideTimer=setTimeout(hide,CONFIG.accountPreviewHideDelayMs);
+  }
+
+  function bindAccountPreview(button, authorEl, uid) {
+    PROFILE_PREVIEW_BINDINGS.set(button,{authorEl,uid:String(uid)});
+  }
+
+  function accountPreviewEventBinding(event) {
+    const button=event.target?.closest?.(".ns-ai-profile-tag");
+    if(!button)return null;
+    const binding=PROFILE_PREVIEW_BINDINGS.get(button);
+    return binding?{...binding,button}:null;
+  }
+
+  accountPreviewEl.addEventListener("pointerenter",()=>clearTimeout(accountPreviewHideTimer));
+  accountPreviewEl.addEventListener("pointerleave",()=>hideAccountPreview(false));
+  document.addEventListener("pointerover",event=>{
+    if(event.pointerType==="touch")return;
+    const binding=accountPreviewEventBinding(event);if(!binding)return;
+    if(event.relatedTarget&&binding.button.contains?.(event.relatedTarget))return;
+    scheduleAccountPreview(binding.authorEl,binding.uid,binding.button);
+  });
+  document.addEventListener("pointerout",event=>{
+    const binding=accountPreviewEventBinding(event);if(!binding)return;
+    if(event.relatedTarget&&binding.button.contains?.(event.relatedTarget))return;
+    hideAccountPreview(false);
+  });
+  document.addEventListener("focusin",event=>{
+    const binding=accountPreviewEventBinding(event);if(binding)scheduleAccountPreview(binding.authorEl,binding.uid,binding.button);
+  });
+  document.addEventListener("focusout",event=>{
+    const binding=accountPreviewEventBinding(event);if(binding)hideAccountPreview(false);
+  });
 
 
   // ============================================================
@@ -6290,26 +7053,118 @@ ${escapeDataForPrompt(payload)}
     return null;
   }
 
+  function connectedProfileWraps(uid) {
+    uid = String(uid);
+    const wraps = PROFILE_BUTTON_WRAPS_BY_UID.get(uid);
+    if (!wraps) return [];
+    const connected = [];
+    for (const wrap of wraps) {
+      if (wrap?.isConnected !== false) connected.push(wrap);
+      else wraps.delete(wrap);
+    }
+    if (!wraps.size) PROFILE_BUTTON_WRAPS_BY_UID.delete(uid);
+    return connected;
+  }
+
+  function uidHasConnectedProfileButton(uid) {
+    return connectedProfileWraps(uid).length > 0;
+  }
+
+  function registerProfileWrap(uid, wrap) {
+    uid = String(uid);
+    if (!PROFILE_BUTTON_WRAPS_BY_UID.has(uid)) PROFILE_BUTTON_WRAPS_BY_UID.set(uid, new Set());
+    PROFILE_BUTTON_WRAPS_BY_UID.get(uid).add(wrap);
+  }
+
+  function releaseDetachedUidState(uid) {
+    uid = String(uid);
+    if (currentUid === uid || uidHasConnectedProfileButton(uid)) return;
+    const state = USER_STATES.get(uid);
+    if (state?.fast?.status === "running" || state?.deep?.status === "running") return;
+    UID_STORAGE_HYDRATED.delete(uid);
+    USER_STATES.delete(uid);
+  }
+
+  function unregisterProfileWrap(uid, wrap) {
+    uid = String(uid);
+    const wraps = PROFILE_BUTTON_WRAPS_BY_UID.get(uid);
+    if (!wraps) return;
+    wraps.delete(wrap);
+    if (!wraps.size) {
+      PROFILE_BUTTON_WRAPS_BY_UID.delete(uid);
+      releaseDetachedUidState(uid);
+    }
+  }
+
+  function removeProfileWrap(wrap) {
+    if (!wrap) return;
+    unregisterProfileWrap(wrap.dataset?.uid || "", wrap);
+    wrap.remove();
+  }
+
+  function pruneDisconnectedProfileWraps() {
+    for (const [uid,wraps] of PROFILE_BUTTON_WRAPS_BY_UID) {
+      for (const wrap of Array.from(wraps)) if (!wrap?.isConnected) wraps.delete(wrap);
+      if (!wraps.size) {
+        PROFILE_BUTTON_WRAPS_BY_UID.delete(uid);
+        releaseDetachedUidState(uid);
+      }
+    }
+  }
+
+  function setClassState(el, className, enabled) {
+    if (!el?.classList || el.classList.contains(className) === enabled) return;
+    el.classList.toggle(className, enabled);
+  }
+
+  function setAttributeIfChanged(el, name, value) {
+    if (!el?.getAttribute || !el?.setAttribute) return;
+    if (el.getAttribute(name) !== String(value)) el.setAttribute(name, String(value));
+  }
+
   function updateUidButtons(uid) {
     uid=String(uid); const state=getUserState(uid);
-    const fastCached=!!readCache(CONFIG.fastCachePrefix,uid,CONFIG.fastCacheTtl); const deepCached=!!readCache(CONFIG.deepCachePrefix,uid,CONFIG.deepCacheTtl);
-    const persistentFast=readPersistentTask(uid,"fast"); const persistentDeep=readPersistentTask(uid,"deep");
-    const running=state.fast.status==="running"||state.deep.status==="running"||isPersistentTaskActive(persistentFast)||isPersistentTaskActive(persistentDeep); const doneFast=!!state.fast.result||fastCached; const doneDeep=!!state.deep.result||deepCached;
-    document.querySelectorAll(`.ns-ai-profile-wrap[data-uid="${uid}"]`).forEach(w=>{
-      w.classList.toggle("ns-ai-tag-running",running); w.classList.toggle("ns-ai-tag-done",!running&&doneFast); w.classList.toggle("ns-ai-tag-deep",!running&&doneDeep);
-      const b=w.querySelector(".ns-ai-profile-tag"); if(b){b.textContent=running?"⏳ AI画像":(doneFast||doneDeep)?"✓ AI画像":"AI 画像"; b.title=doneDeep?"已查询：深度交易报告有缓存/结果":doneFast?"已查询：快速画像有缓存/结果":running?"该用户有分析任务正在运行":"查看 AI 画像";}
+    const running=state.fast.status==="running"||state.deep.status==="running"; const doneFast=!!state.fast.result; const doneDeep=!!state.deep.result;
+    const text=running?"⏳ AI画像":(doneFast||doneDeep)?"✓ AI画像":"AI 画像";
+    const title=doneDeep?"已查询：深度交易报告有缓存/结果":doneFast?"已查询：快速画像有缓存/结果":running?"该用户有分析任务正在运行":"查看 AI 画像";
+    connectedProfileWraps(uid).forEach(w=>{
+      setClassState(w,"ns-ai-tag-running",running); setClassState(w,"ns-ai-tag-done",!running&&doneFast); setClassState(w,"ns-ai-tag-deep",!running&&doneDeep);
+      const b=w.querySelector(".ns-ai-profile-tag"); if(b){
+        if(b.textContent!==text)b.textContent=text;
+        setAttributeIfChanged(b,"aria-label",title);
+        if(AI_SETTINGS.accountPreview?.enabled===true){if(b.hasAttribute?.("title"))b.removeAttribute("title");}
+        else setAttributeIfChanged(b,"title",title);
+      }
     });
   }
 
-  function loadCachedIntoState(uid) {
+  function loadCachedResultsIntoState(uid) {
+    uid = String(uid);
     const state=getUserState(uid);
-    const fast=readCache(CONFIG.fastCachePrefix,uid,CONFIG.fastCacheTtl); if(fast?.profile&&fast?.account){state.account=fast.account;state.fast.result=fast.profile;state.fast.meta={...fast.meta,localCacheHit:true};if(state.fast.status!=="running")state.fast.status="done";}
-    const deep=readCache(CONFIG.deepCachePrefix,uid,CONFIG.deepCacheTtl); if(deep?.report&&deep?.account){state.account=state.account||deep.account;state.deep.result=deep.report;state.deep.meta={...deep.meta,localCacheHit:true};if(state.deep.status!=="running")state.deep.status="done";}
+    const fast=readCache(CONFIG.fastCachePrefix,uid,CONFIG.fastCacheTtl);
+    if(fast?.profile&&fast?.account){state.account=fast.account;state.fast.result=fast.profile;state.fast.meta={...fast.meta,localCacheHit:true};if(state.fast.status!=="running")state.fast.status="done";}
+    const deep=readCache(CONFIG.deepCachePrefix,uid,CONFIG.deepCacheTtl);
+    if(deep?.report&&deep?.account){state.account=state.account||deep.account;state.deep.result=deep.report;state.deep.meta={...deep.meta,localCacheHit:true};if(state.deep.status!=="running")state.deep.status="done";}
     return state;
   }
 
-  function openUserMode(uid, mode, button) {
-    uid=String(uid); currentUid=uid; currentButton=button||currentButton; activeMode=mode; const state=loadCachedIntoState(uid); state.viewMode=mode; showPanel();
+  function hydrateUidStorageState(uid, force = false) {
+    uid = String(uid);
+    if (!force && UID_STORAGE_HYDRATED.has(uid)) return getUserState(uid);
+    UID_STORAGE_HYDRATED.add(uid);
+    const state = loadCachedResultsIntoState(uid);
+    syncPersistentTaskSlot(uid,"fast",false);
+    syncPersistentTaskSlot(uid,"deep",false);
+    updateUidButtons(uid);
+    return state;
+  }
+
+  function loadCachedIntoState(uid) {
+    return hydrateUidStorageState(uid,true);
+  }
+
+  function openUserMode(uid, mode, button, refreshStored = true) {
+    uid=String(uid); currentUid=uid; currentButton=button||currentButton; activeMode=mode; const state=refreshStored?loadCachedIntoState(uid):hydrateUidStorageState(uid); state.viewMode=mode; showPanel();
     if(state.account) renderAccount(state.account); else accountEl.style.display="none";
     const slot=state[mode];
     if(slot.status==="running"&&slot.task){renderTaskSnapshot(slot.task);return;}
@@ -6341,24 +7196,90 @@ ${escapeDataForPrompt(payload)}
     openModerationRecords(account,false);
   }
 
-  function injectButtons() {
-    const users=document.querySelectorAll('.author-info a[href*="/space/"], .username');
+  let profileButtonAnchorSequence = 0;
+
+  function isProfileButtonAuthor(el) {
+    if (el.matches?.('.author-info a[href*="/space/"]')) return true;
+    return el.matches?.(".username") && /\/space\/\d+/.test(location.pathname);
+  }
+
+  function profileButtonScope(el) {
+    return el.closest?.(".author-info") || el.parentElement || document.body;
+  }
+
+  function profileButtonAnchorId(el) {
+    if (el.dataset.nsAiProfileAnchorId) return el.dataset.nsAiProfileAnchorId;
+    const id = `a${Date.now().toString(36)}${(++profileButtonAnchorSequence).toString(36)}`;
+    el.dataset.nsAiProfileAnchorId = id;
+    return id;
+  }
+
+  function createProfileButtonWrap(authorEl, uid, anchorId) {
+    const wrap=document.createElement("span");wrap.className="ns-ai-profile-wrap";wrap.dataset.uid=uid;wrap.dataset.anchorId=anchorId;wrap.dataset.nsAiOwned="true";
+    const button=document.createElement("button");button.type="button";button.className="ns-ai-profile-tag";button.dataset.uid=uid;button.textContent="AI 画像";
+    const more=document.createElement("button");more.type="button";more.className="ns-ai-profile-more";more.textContent="▼";more.title="更多操作";
+    const menu=document.createElement("div");menu.className="ns-ai-profile-menu-popup";
+    const addItem=(text,handler)=>{const b=document.createElement("button");b.type="button";b.textContent=text;b.addEventListener("click",e=>{e.preventDefault();e.stopPropagation();wrap.classList.remove("menu-open");hideAccountPreview(true);handler();});menu.appendChild(b);};
+    addItem("🧭 快速画像",()=>openUserMode(uid,"fast",button));
+    addItem("🔍 直接深度交易分析",()=>openUserMode(uid,"deep",button));
+    addItem("⚖️ 管理记录",()=>openModerationForUid(uid));
+    addItem("⚙️ 插件设置",()=>openSettingsModal(AI_PROVIDER));
+    button.addEventListener("click",e=>{e.preventDefault();e.stopPropagation();hideAccountPreview(true);const mode=resolvePrimaryOpenMode(uid);if(currentUid===uid&&currentButton===button&&panel.style.display!=="none"&&activeMode===mode){hidePanel();return;}openUserMode(uid,mode,button,false);});
+    more.addEventListener("click",e=>{e.preventDefault();e.stopPropagation();hideAccountPreview(true);document.querySelectorAll(".ns-ai-profile-wrap.menu-open").forEach(x=>{if(x!==wrap)x.classList.remove("menu-open")});wrap.classList.toggle("menu-open");});
+    bindAccountPreview(button,authorEl,uid);
+    wrap.append(button,more,menu);
+    return wrap;
+  }
+
+  function reconcileProfileButton(el, uid) {
+    uid = String(uid);
+    const scope = profileButtonScope(el);
+    const previous = PROFILE_BUTTON_BINDINGS.get(el);
+    if (previous?.uid === uid && previous.wrap?.isConnected) {
+      const duplicates = Array.from(scope.querySelectorAll?.(`.ns-ai-profile-wrap[data-uid="${uid}"]`) || []);
+      for (const duplicate of duplicates) if (duplicate !== previous.wrap) removeProfileWrap(duplicate);
+      registerProfileWrap(uid,previous.wrap);
+      updateUidButtons(uid);
+      return previous.wrap;
+    }
+    if (previous?.wrap?.isConnected) removeProfileWrap(previous.wrap);
+
+    const anchorId = profileButtonAnchorId(el);
+    const candidates = Array.from(scope.querySelectorAll?.(`.ns-ai-profile-wrap[data-uid="${uid}"]`) || []);
+    let wrap = candidates.find(item=>item.dataset.anchorId===anchorId) || candidates[0] || null;
+    for (const duplicate of candidates) if (duplicate !== wrap) removeProfileWrap(duplicate);
+
+    if (!wrap) {
+      wrap = createProfileButtonWrap(el,uid,anchorId);
+      el.insertAdjacentElement("afterend",wrap);
+    } else {
+      wrap.dataset.uid=uid;
+      wrap.dataset.anchorId=anchorId;
+    }
+    el.dataset.nsAiProfileUid=uid;
+    PROFILE_BUTTON_BINDINGS.set(el,{uid,wrap});
+    registerProfileWrap(uid,wrap);
+    const profileButton=wrap.querySelector?.(".ns-ai-profile-tag");
+    if(profileButton)bindAccountPreview(profileButton,el,uid);
+    hydrateUidStorageState(uid,false);
+    return wrap;
+  }
+
+  const PROFILE_AUTHOR_SELECTOR = '.author-info a[href*="/space/"], .username';
+
+  function injectButtons(roots = [document]) {
+    const users = new Set();
+    const sourceRoots = Array.isArray(roots) ? roots : [roots];
+    if (sourceRoots.includes(document)) pruneDisconnectedProfileWraps();
+    for (const root of sourceRoots) {
+      if (!root) continue;
+      if (root.nodeType === 1 && root.matches?.(PROFILE_AUTHOR_SELECTOR)) users.add(root);
+      for (const el of root.querySelectorAll?.(PROFILE_AUTHOR_SELECTOR) || []) users.add(el);
+    }
     for(const el of users){
+      if(!isProfileButtonAuthor(el))continue;
       const uid=getUidFromElement(el); if(!uid)continue;
-      if(el.dataset.nsAiProfileUid===uid && el.nextElementSibling?.classList?.contains("ns-ai-profile-wrap")){updateUidButtons(uid);continue;}
-      if(el.nextElementSibling?.classList?.contains("ns-ai-profile-wrap"))el.nextElementSibling.remove(); el.dataset.nsAiProfileUid=uid;
-      const wrap=document.createElement("span");wrap.className="ns-ai-profile-wrap";wrap.dataset.uid=uid;
-      const button=document.createElement("button");button.type="button";button.className="ns-ai-profile-tag";button.dataset.uid=uid;button.textContent="AI 画像";
-      const more=document.createElement("button");more.type="button";more.className="ns-ai-profile-more";more.textContent="▼";more.title="更多操作";
-      const menu=document.createElement("div");menu.className="ns-ai-profile-menu-popup";
-      const addItem=(text,handler)=>{const b=document.createElement("button");b.type="button";b.textContent=text;b.addEventListener("click",e=>{e.preventDefault();e.stopPropagation();wrap.classList.remove("menu-open");handler();});menu.appendChild(b);};
-      addItem("🧭 快速画像",()=>openUserMode(uid,"fast",button));
-      addItem("🔍 直接深度交易分析",()=>openUserMode(uid,"deep",button));
-      addItem("⚖️ 管理记录",()=>openModerationForUid(uid));
-      addItem("⚙️ 插件设置",()=>openSettingsModal(AI_PROVIDER));
-      button.addEventListener("click",e=>{e.preventDefault();e.stopPropagation();const mode=resolvePrimaryOpenMode(uid);if(currentUid===uid&&currentButton===button&&panel.style.display!=="none"&&activeMode===mode){hidePanel();return;}openUserMode(uid,mode,button);});
-      more.addEventListener("click",e=>{e.preventDefault();e.stopPropagation();document.querySelectorAll(".ns-ai-profile-wrap.menu-open").forEach(x=>{if(x!==wrap)x.classList.remove("menu-open")});wrap.classList.toggle("menu-open");});
-      wrap.append(button,more,menu); el.insertAdjacentElement("afterend",wrap); updateUidButtons(uid);
+      reconcileProfileButton(el,uid);
     }
   }
 
@@ -6461,9 +7382,10 @@ ${escapeDataForPrompt(payload)}
   // 全局事件
   // ============================================================
 
-  closeEl.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); hidePanel(); });
+  closeEl.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); hideAccountPreview(true); hidePanel(); });
   panel.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", (e) => {
+    if (!e.target.closest?.("#ns-ai-account-preview") && !e.target.closest?.(".ns-ai-profile-tag")) hideAccountPreview(true);
     if (!e.target.closest?.(".ns-ai-profile-wrap")) document.querySelectorAll(".ns-ai-profile-wrap.menu-open").forEach((x) => x.classList.remove("menu-open"));
     if (
       panel.style.display !== "none" &&
@@ -6480,6 +7402,7 @@ ${escapeDataForPrompt(payload)}
     }
   });
   window.addEventListener("resize", () => {
+    hideAccountPreview(true);
     if (panelUserResized) {
       const w = Math.min(panel.offsetWidth || 410, Math.max(340, window.innerWidth - 16));
       const h = Math.min(panel.offsetHeight || 520, Math.max(280, window.innerHeight - 16));
@@ -6487,24 +7410,112 @@ ${escapeDataForPrompt(payload)}
     }
     positionPanel(false);
   }, { passive: true });
-  window.addEventListener("scroll", () => positionPanel(false), { passive: true });
+  window.addEventListener("scroll", () => { hideAccountPreview(true); positionPanel(false); }, { passive: true });
 
+  const NS_AI_OWNED_MUTATION_SELECTOR = [
+    '[data-ns-ai-owned="true"]',
+    "#ns-ai-profile-panel",
+    "#ns-ai-settings-overlay",
+    "#ns-ai-share-overlay",
+    "#ns-ai-image-consent-overlay",
+    "#ns-ai-moderation-overlay",
+    "#ns-ai-moderation-consent-overlay",
+    "#ns-ai-account-preview",
+    ".ns-ai-toast",
+  ].join(",");
+  const pendingInjectionRoots = new Set();
   let injectScheduled = false;
-  function scheduleInject() {
+  let profileDomDirtyWhileHidden = false;
+  let profileObserver = null;
+
+  function nodeInsideOwnedUi(node) {
+    const element = node?.nodeType === 1 ? node : node?.parentElement;
+    return !!element?.closest?.(NS_AI_OWNED_MUTATION_SELECTOR);
+  }
+
+  function nodeContainsProfileAuthor(node) {
+    if (!node || ![1, 11].includes(node.nodeType)) return false;
+    return !!node.matches?.(PROFILE_AUTHOR_SELECTOR) || !!node.querySelector?.(PROFILE_AUTHOR_SELECTOR);
+  }
+
+  function unregisterRemovedProfileWraps(node) {
+    if (!node || node.nodeType !== 1) return;
+    const wraps = [];
+    if (node.matches?.(".ns-ai-profile-wrap")) wraps.push(node);
+    for (const wrap of node.querySelectorAll?.(".ns-ai-profile-wrap") || []) wraps.push(wrap);
+    for (const wrap of wraps) {
+      // appendChild 等移动操作也会产生 removedNodes；回调执行时仍连接的节点不应注销。
+      if (wrap.isConnected) continue;
+      unregisterProfileWrap(wrap.dataset?.uid || "",wrap);
+    }
+  }
+
+  function scheduleInject(root = document) {
+    if (document.hidden) {
+      profileDomDirtyWhileHidden = true;
+      return;
+    }
+    const candidate = root?.nodeType ? root : document;
+    pendingInjectionRoots.add(candidate);
     if (injectScheduled) return;
     injectScheduled = true;
-    requestAnimationFrame(() => { injectScheduled = false; injectButtons(); });
+    requestAnimationFrame(() => {
+      injectScheduled = false;
+      if (document.hidden) {
+        profileDomDirtyWhileHidden = true;
+        pendingInjectionRoots.clear();
+        return;
+      }
+      const roots = Array.from(pendingInjectionRoots);
+      pendingInjectionRoots.clear();
+      injectButtons(roots.length ? roots : [document]);
+    });
+  }
+
+  function handleProfileMutations(mutations) {
+    if (document.hidden) {
+      profileDomDirtyWhileHidden = true;
+      return;
+    }
+    for (const mutation of mutations || []) {
+      for (const node of mutation.removedNodes || []) unregisterRemovedProfileWraps(node);
+      if (nodeInsideOwnedUi(mutation.target)) continue;
+      for (const node of mutation.addedNodes || []) {
+        if (nodeInsideOwnedUi(node) || !nodeContainsProfileAuthor(node)) continue;
+        scheduleInject(node);
+      }
+    }
+  }
+
+  function observeProfileDom() {
+    if (!profileObserver || document.hidden) return;
+    profileObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   if (IS_TASK_WORKER) {
     initializeTaskWorker();
-    console.log(`[NodeSeek AI] 临时任务窗口 v2.8.0 已加载 · ${aiDisplayName()}`);
+    console.log(`[NodeSeek AI] 临时任务窗口 v2.8.1 已加载 · ${aiDisplayName()}`);
   } else {
     initializeTaskBridge();
-    const observer = new MutationObserver(scheduleInject);
-    observer.observe(document.body, { childList: true, subtree: true });
-    window.addEventListener("popstate", scheduleInject);
-    injectButtons();
-    console.log(`[NodeSeek AI] 用户画像 v2.8.0 已加载 · ${aiDisplayName()}`);
+    profileObserver = new MutationObserver(handleProfileMutations);
+    if (!document.hidden) {
+      injectButtons([document]);
+      observeProfileDom();
+    } else profileDomDirtyWhileHidden = true;
+    window.addEventListener("popstate", () => scheduleInject(document));
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        profileDomDirtyWhileHidden = true;
+        profileObserver?.disconnect?.();
+        pendingInjectionRoots.clear();
+        return;
+      }
+      observeProfileDom();
+      if (profileDomDirtyWhileHidden) {
+        profileDomDirtyWhileHidden = false;
+        scheduleInject(document);
+      }
+    });
+    console.log(`[NodeSeek AI] 用户画像 v2.8.1 已加载 · ${aiDisplayName()}`);
   }
 })();
